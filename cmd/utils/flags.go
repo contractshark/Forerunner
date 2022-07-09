@@ -1,3 +1,6 @@
+// Copyright (c) 2021 Microsoft Corporation. 
+ // Licensed under the GNU General Public License v3.0.
+
 // Copyright 2015 The go-ethereum Authors
 // This file is part of go-ethereum.
 //
@@ -63,7 +66,7 @@ import (
 	"github.com/ethereum/go-ethereum/rpc"
 	whisper "github.com/ethereum/go-ethereum/whisper/whisperv6"
 	pcsclite "github.com/gballet/go-libpcsclite"
-	cli "gopkg.in/urfave/cli.v1"
+	"gopkg.in/urfave/cli.v1"
 )
 
 var (
@@ -749,6 +752,220 @@ var (
 		Usage: "External EVM configuration (default = built-in interpreter)",
 		Value: "",
 	}
+
+	// MSRA eth toolbox
+	NodeNameFlag = cli.StringFlag{
+		Name:  "nodename",
+		Usage: "Node name to identify server",
+		Value: "",
+	}
+	SilentFlag = cli.BoolFlag{
+		Name:  "silent",
+		Usage: "Disable logging",
+	}
+	LogRootFlag = DirectoryFlag{
+		Name:  "logdir",
+		Usage: "Log directory",
+		Value: "",
+	}
+
+	PreplayEnabledChainheadFlag = cli.BoolFlag{
+		Name:  "preplay.chainhead",
+		Usage: "Enable chainhead driven preplaying",
+	}
+	PreplayDirChainheadFlag = DirectoryFlag{
+		Name:  "preplaydir.chainhead",
+		Usage: "Log directory for chainhead driven preplay result",
+		Value: DirectoryString(filepath.Join(node.DefaultDataDir(), "preplaydata", "chainhead-driven")),
+	}
+
+	CmpReuseEnabledFlag = cli.BoolFlag{
+		Name:  "cmpreuse",
+		Usage: "Enable computation reuse",
+	}
+	MemStatusEnabledFlag = cli.BoolFlag{
+		Name:  "memstatus",
+		Usage: "Enable println memory status",
+	}
+
+	CmpReuseCheckFlag = cli.BoolFlag{
+		Name:  "cmpreuse.check",
+		Usage: "Enable computation reuse dirty write checking",
+	}
+	TaskBuilderCheckFlag = cli.BoolFlag{
+		Name:  "taskbuilder.check",
+		Usage: "Enable task builder debug log",
+	}
+	TxApplyPerfLogFlag = cli.BoolFlag{
+		Name:  "txapplyperflog",
+		Usage: "Enable tx perf measurement and log",
+	}
+	PerfLogFlag = cli.BoolFlag{
+		Name:  "perflog",
+		Usage: "Enable block perf measurement and log",
+	}
+	CmpReuseLogFlag = cli.BoolFlag{
+		Name:  "cmpreuse.log",
+		Usage: "Enable computation reuse result logging",
+	}
+	CmpReuseLogDirFlag = DirectoryFlag{
+		Name:  "cmpreuse.log.dir",
+		Usage: "Log directory for computation reuse result",
+		Value: DirectoryString(filepath.Join(node.DefaultDataDir(), "cmpreuse")),
+	}
+	ReuseTracerCheckFlag = cli.BoolFlag{
+		Name:  "reusetracer.check",
+		Usage: "Enable reuse tracer checking",
+	}
+	SelfishFlag = cli.BoolFlag{
+		Name:  "selfish",
+		Usage: "Ignore GetNodeDataMsg for performance measurement",
+	}
+	CacheRecordEnabledFlag = cli.BoolFlag{
+		Name:  "cacherecord",
+		Usage: "Enable cache record",
+	}
+	GroundRecordEnabledFlag = cli.BoolFlag{
+		Name:  "groundrecord",
+		Usage: "Enable ground record",
+	}
+	PreplayRecordEnabledFlag = cli.BoolFlag{
+		Name:  "preplayrecord",
+		Usage: "Enable preplay record",
+	}
+
+	DataLoggerFlag = cli.StringFlag{
+		Name:  "datalogger",
+		Usage: "Comma separated list of data structures needs being logged",
+		Value: "",
+	}
+	DataLoggerDirTxpoolSnapFlag = DirectoryFlag{
+		Name:  "dataloggerdir.txpoolsnap",
+		Usage: "Log directory for txpool snapshot",
+		Value: DirectoryString(filepath.Join(node.DefaultDataDir(), "logdata", "txpoolsnap")),
+	}
+	DataLoggerDirTxpoolIOFlag = DirectoryFlag{
+		Name:  "dataloggerdir.txpoolio",
+		Usage: "Log directory for tx in and out txpool",
+		Value: DirectoryString(filepath.Join(node.DefaultDataDir(), "logdata", "txpoolio")),
+	}
+	DataLoggerDirInsertchainFlag = DirectoryFlag{
+		Name:  "dataloggerdir.insertchain",
+		Usage: "Log directory for insertchain invoking",
+		Value: DirectoryString(filepath.Join(node.DefaultDataDir(), "logdata", "insertchain")),
+	}
+
+	DelayedBlockFlag = cli.IntFlag{
+		Name:  "delayedBlockStats",
+		Usage: "Collect stats about delayed blocks (default = 1, 0 to turn off, 2 for detailed info)",
+		Value: 1,
+	}
+
+	// MSRA New flag
+	PreplayFlag = cli.BoolFlag{
+		Name:  "preplay",
+		Usage: "Enable the Transaction Preplay service",
+	}
+
+	FeatureFlag = cli.BoolFlag{
+		Name:  "feature",
+		Usage: "Enable the Feature Collect service",
+	}
+
+	ReuseVerifierFlag = cli.BoolFlag{
+		Name:  "reuseverify",
+		Usage: "Enable the Reuse Verify service",
+	}
+
+	HasherParallelismFlag = cli.IntFlag{
+		Name:  "parallelhasher",
+		Usage: "The number of goroutines for parallelized hash and commit (default = 0, no parallelism)",
+	}
+
+	ParallelBloomFlag = cli.BoolFlag{
+		Name:  "parallelbloom",
+		Usage: "Enable pipelined bloom creation",
+	}
+
+	EmulatorDirFlag = DirectoryFlag{
+		Name:  "emulatordir",
+		Usage: "Emulator data directory, shared by Emulator Logger and Emulate Mode",
+		Value: DirectoryString(filepath.Join(node.DefaultDataDir(), "emulatorLog")),
+	}
+	EmulatorLoggerFlag = cli.BoolFlag{
+		Name:  "emulatorlogger",
+		Usage: "Enable the Emulator Logger service",
+	}
+	EmulateFromFlag = cli.Uint64Flag{
+		Name:  "emulatefrom",
+		Usage: "Enable the Emulate Mode, and set its start block (exclusive)",
+		Value: 9271712,
+	}
+	EmulateFileFlag = cli.StringFlag{
+		Name:  "emulatefile",
+		Usage: "The log file for emulate mode to read, relative to emulatordir",
+	}
+
+	// Emulator Log Generator
+	GenerateEmulatorLogFromFlag = cli.Uint64Flag{
+		Name:  "generateemulatorlogfrom",
+		Usage: "Generate emulator log from the given block number (inclusive)",
+		Value: 9271712,
+	}
+	GenerateEmulatorLogToFlag = cli.Uint64Flag{
+		Name:  "generateemulatorlogto",
+		Usage: "Generate emulator log to the given block number (exclusive)",
+		Value: 9271812,
+	}
+
+	ParallelizeReuseFlag = cli.BoolFlag{
+		Name:  "parallelizereuse",
+		Usage: "Parallelize reuse and real apply when apply (enable only when reuse mode)",
+	}
+	WarmupMissDetailFlag = cli.BoolFlag{
+		Name:  "warmupmissdetail",
+		Usage: "Classify warmup miss of address and key by detail",
+	}
+	ReportMissDetailFlag = cli.BoolFlag{
+		Name:  "reportmissdetail",
+		Usage: "Report transactions' miss detail",
+	}
+	SingleFutureFlag = cli.BoolFlag{
+		Name:  "single-future",
+		Usage: "Preplay in single future mode",
+	}
+	NoTraceFlag = cli.BoolFlag{
+		Name:  "no-trace",
+		Usage: "Turn off trace",
+	}
+	NoMemoizationFlag = cli.BoolFlag{
+		Name:  "no-memoization",
+		Usage: "Turn off memoization",
+	}
+	NoWarmuperFlag = cli.BoolFlag{
+		Name:  "no-warmuper",
+		Usage: "Close warmuper during preplay",
+	}
+	NoOverMatchingFlag = cli.BoolFlag{
+		Name:  "no-overmatching",
+		Usage: "Close over matching during preplay",
+	}
+	NoReuseFlag = cli.BoolFlag{
+		Name:  "no-reuse",
+		Usage: "Disable computation reuse in process",
+	}
+	AddFastPathFlag = cli.BoolFlag{
+		Name:  "add-fastpath",
+		Usage: "add mix/rw-tree before trace",
+	}
+	DetailTimeFlag = cli.BoolFlag{
+		Name:  "detailtime",
+		Usage: "measure detail time consumption in reuse",
+	}
+	FindAllStateFrom = cli.Uint64Flag{
+		Name:  "statefrom",
+		Usage: "print all state from the given block number",
+	}
 )
 
 // MakeDataDir retrieves the currently requested data directory, terminating
@@ -1162,6 +1379,25 @@ func SetP2PConfig(ctx *cli.Context, cfg *p2p.Config) {
 		cfg.NoDiscovery = true
 		cfg.DiscoveryV5 = false
 	}
+
+	if ctx.GlobalIsSet(DelayedBlockFlag.Name) {
+		cfg.DelayedBlockStatsLevel = ctx.GlobalInt(DelayedBlockFlag.Name)
+	} else {
+		cfg.DelayedBlockStatsLevel = 1
+	}
+
+	// New flag
+	if ctx.GlobalIsSet(PreplayFlag.Name) {
+		cfg.EnablePreplay = true
+	} else {
+		cfg.EnablePreplay = false
+	}
+
+	if ctx.GlobalIsSet(FeatureFlag.Name) {
+		cfg.EnableFeature = true
+	} else {
+		cfg.EnableFeature = false
+	}
 }
 
 // SetNodeConfig applies node-related command line flags to the config.
@@ -1174,6 +1410,31 @@ func SetNodeConfig(ctx *cli.Context, cfg *node.Config) {
 	setNodeUserIdent(ctx, cfg)
 	setDataDir(ctx, cfg)
 	setSmartCard(ctx, cfg)
+
+	// MSRA config
+	if ctx.GlobalIsSet(NodeNameFlag.Name) {
+		cfg.MSRANodeSettings.NodeName = ctx.GlobalString(NodeNameFlag.Name)
+	}
+
+	if ctx.GlobalBool(PreplayEnabledChainheadFlag.Name) {
+		cfg.MSRANodeSettings.PreplayEnabledChainhead = ctx.GlobalBool(PreplayEnabledChainheadFlag.Name)
+	}
+	if ctx.GlobalIsSet(PreplayDirChainheadFlag.Name) {
+		cfg.MSRANodeSettings.PreplayDirChainhead = ctx.GlobalString(PreplayDirChainheadFlag.Name)
+	}
+	cfg.MSRANodeSettings.DataLoggerInsertchain = false
+	if ctx.GlobalIsSet(DataLoggerFlag.Name) {
+		dataloggerModules := splitAndTrim(ctx.GlobalString(DataLoggerFlag.Name))
+		for _, module := range dataloggerModules {
+			switch module {
+			case "insertchain":
+				cfg.MSRANodeSettings.DataLoggerInsertchain = true
+			}
+		}
+	}
+	if ctx.GlobalIsSet(DataLoggerDirInsertchainFlag.Name) {
+		cfg.MSRANodeSettings.DataLoggerDirInsertchain = ctx.GlobalString(DataLoggerDirInsertchainFlag.Name)
+	}
 
 	if ctx.GlobalIsSet(ExternalSignerFlag.Name) {
 		cfg.ExternalSigner = ctx.GlobalString(ExternalSignerFlag.Name)
@@ -1277,6 +1538,30 @@ func setTxPool(ctx *cli.Context, cfg *core.TxPoolConfig) {
 	}
 	if ctx.GlobalIsSet(TxPoolLifetimeFlag.Name) {
 		cfg.Lifetime = ctx.GlobalDuration(TxPoolLifetimeFlag.Name)
+	}
+
+	if ctx.GlobalIsSet(NodeNameFlag.Name) {
+		cfg.MSRATxPoolSettings.NodeName = ctx.GlobalString(NodeNameFlag.Name)
+	}
+	cfg.MSRATxPoolSettings.DataLoggerTxPoolSnap = false
+	cfg.MSRATxPoolSettings.DataLoggerTxPoolIO = false
+	if ctx.GlobalIsSet(DataLoggerFlag.Name) {
+		dataloggerModules := splitAndTrim(ctx.GlobalString(DataLoggerFlag.Name))
+		for _, module := range dataloggerModules {
+			switch module {
+			case "txpoolsnap":
+				cfg.MSRATxPoolSettings.DataLoggerTxPoolSnap = true
+			case "txpoolio":
+				cfg.MSRATxPoolSettings.DataLoggerTxPoolIO = true
+			}
+		}
+	}
+
+	if ctx.GlobalIsSet(DataLoggerDirTxpoolSnapFlag.Name) {
+		cfg.MSRATxPoolSettings.DataLoggerDirTxPoolSnap = ctx.GlobalString(DataLoggerDirTxpoolSnapFlag.Name)
+	}
+	if ctx.GlobalIsSet(DataLoggerDirTxpoolIOFlag.Name) {
+		cfg.MSRATxPoolSettings.DataLoggerDirTxPoolIO = ctx.GlobalString(DataLoggerDirTxpoolIOFlag.Name)
 	}
 }
 
@@ -1522,6 +1807,84 @@ func SetEthConfig(ctx *cli.Context, stack *node.Node, cfg *eth.Config) {
 			cfg.Miner.GasPrice = big.NewInt(1)
 		}
 	}
+	cfg.MSRAVMSettings = vm.MSRAVMConfig{
+		Silent:              ctx.GlobalBool(SilentFlag.Name),
+		LogRoot:             "",
+		MemStatus:           ctx.GlobalBool(MemStatusEnabledFlag.Name),
+		CmpReuse:            ctx.GlobalBool(CmpReuseEnabledFlag.Name),
+		CmpReuseChecking:    ctx.GlobalBool(CmpReuseCheckFlag.Name),
+		TaskBuilderChecking: ctx.GlobalBool(TaskBuilderCheckFlag.Name),
+		TxApplyPerfLogging:  ctx.GlobalBool(TxApplyPerfLogFlag.Name),
+		PerfLogging:         ctx.GlobalBool(PerfLogFlag.Name),
+		CmpReuseLogging:     ctx.GlobalBool(CmpReuseLogFlag.Name),
+		CmpReuseLoggingDir:  filepath.Join(node.DefaultDataDir(), "cmpreuse"),
+		EnablePreplay:       ctx.GlobalBool(PreplayFlag.Name),
+		CacheRecord:         ctx.GlobalBool(CacheRecordEnabledFlag.Name),
+		GroundRecord:        ctx.GlobalBool(GroundRecordEnabledFlag.Name),
+		PreplayRecord:       ctx.GlobalBool(PreplayRecordEnabledFlag.Name),
+		EnableReuseVerifier: ctx.GlobalBool(ReuseVerifierFlag.Name),
+		HasherParallelism:   ctx.GlobalInt(HasherParallelismFlag.Name),
+		PipelinedBloom:      ctx.GlobalBool(ParallelBloomFlag.Name),
+		ReuseTracerChecking: ctx.GlobalBool(ReuseTracerCheckFlag.Name),
+		Selfish:             ctx.GlobalBool(SelfishFlag.Name),
+		NoTrace:             ctx.GlobalBool(NoTraceFlag.Name),
+		NoMemoization:       ctx.GlobalBool(NoMemoizationFlag.Name),
+		NoOverMatching:      ctx.GlobalBool(NoOverMatchingFlag.Name),
+		SingleFuture:        ctx.GlobalBool(SingleFutureFlag.Name),
+		NoWarmuper:          ctx.GlobalBool(NoWarmuperFlag.Name),
+		NoReuse:             ctx.GlobalBool(NoReuseFlag.Name),
+		AddFastPath:         ctx.GlobalBool(AddFastPathFlag.Name),
+		DetailTime:          ctx.GlobalBool(DetailTimeFlag.Name),
+		FindAllStateFrom:    0,
+
+		EnableEmulatorLogger: ctx.GlobalBool(EmulatorLoggerFlag.Name),
+		EmulatorDir:          ctx.GlobalString(EmulatorDirFlag.Name),
+		EmulateFile:          "my.json",
+
+		ParallelizeReuse:  ctx.GlobalBool(ParallelizeReuseFlag.Name),
+		WarmupMissDetail:  ctx.GlobalBool(WarmupMissDetailFlag.Name),
+		ReportMissDetail:  ctx.GlobalBool(ReportMissDetailFlag.Name),
+		GethCacheSizeInMB: ctx.GlobalInt(CacheFlag.Name),
+	}
+
+	if ctx.GlobalIsSet(FindAllStateFrom.Name) {
+		cfg.MSRAVMSettings.FindAllStateFrom = ctx.GlobalUint64(FindAllStateFrom.Name)
+	}
+
+	if ctx.GlobalIsSet(CmpReuseLogDirFlag.Name) {
+		cfg.MSRAVMSettings.CmpReuseLoggingDir = ctx.GlobalString(CmpReuseLogDirFlag.Name)
+	}
+	if ctx.GlobalIsSet(LogRootFlag.Name) {
+		cfg.MSRAVMSettings.LogRoot = ctx.GlobalString(LogRootFlag.Name)
+	}
+	if ctx.GlobalIsSet(EmulatorDirFlag.Name) {
+		cfg.MSRAVMSettings.EmulatorDir = ctx.GlobalString(EmulatorDirFlag.Name)
+	}
+	if ctx.GlobalIsSet(EmulateFileFlag.Name) {
+		cfg.MSRAVMSettings.EmulateFile = ctx.GlobalString(EmulateFileFlag.Name)
+	}
+	// Enable parallel hasher and bloom by default if cmpreuse is enabled
+	if cfg.MSRAVMSettings.CmpReuse {
+		if !ctx.GlobalIsSet(HasherParallelismFlag.Name) {
+			cfg.MSRAVMSettings.HasherParallelism = 16
+		}
+		if !ctx.GlobalIsSet(ParallelBloomFlag.Name) {
+			cfg.MSRAVMSettings.PipelinedBloom = true
+		}
+	}
+
+	if cfg.MSRAVMSettings.NoTrace && cfg.MSRAVMSettings.SingleFuture {
+		panic("NoTrace and SingleFuture cannot be both true")
+	}
+
+	if cfg.MSRAVMSettings.NoMemoization && cfg.MSRAVMSettings.SingleFuture {
+		panic("NoMemoization and SingleFuture cannot be both true")
+	}
+
+	if cfg.MSRAVMSettings.NoTrace && cfg.MSRAVMSettings.NoMemoization {
+		panic("NoTrace and NoMemoization cannot be both true")
+	}
+
 }
 
 // RegisterEthService adds an Ethereum client to the stack.

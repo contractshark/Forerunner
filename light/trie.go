@@ -1,3 +1,6 @@
+// Copyright (c) 2021 Microsoft Corporation. 
+ // Licensed under the GNU General Public License v3.0.
+
 // Copyright 2015 The go-ethereum Authors
 // This file is part of the go-ethereum library.
 //
@@ -112,6 +115,18 @@ func (t *odrTrie) TryUpdate(key, value []byte) error {
 	})
 }
 
+func (t *odrTrie) TryUpdateWithHashedKey(key, hashedKey, value []byte) error {
+	return t.TryUpdate(key, value)
+}
+
+func (t *odrTrie) TryInsertInBatch(keyCopyList, hexKeyList, valueList [][]byte, hashedKeyStringList []string) error {
+	panic("Not implemented yet, TryInsertInBatch should only be called by secure_trie")
+}
+
+func (t *odrTrie) HashKey(key []byte) []byte {
+	return crypto.Keccak256(key)
+}
+
 func (t *odrTrie) TryDelete(key []byte) error {
 	key = crypto.Keccak256(key)
 	return t.do(key, func() error {
@@ -131,6 +146,10 @@ func (t *odrTrie) Hash() common.Hash {
 		return t.id.Root
 	}
 	return t.trie.Hash()
+}
+
+func (t *odrTrie) UseParallelHasher(on bool) {
+	// no-op
 }
 
 func (t *odrTrie) NodeIterator(startkey []byte) trie.NodeIterator {

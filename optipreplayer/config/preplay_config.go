@@ -1,0 +1,14 @@
+// Copyright (c) 2021 Microsoft Corporation. 
+ // Licensed under the GNU General Public License v3.0.
+
+package config
+
+
+const TXN_PREPLAY_ROUND_LIMIT = 12
+const CACHE_NODE_COUNT_LIMIT = 20 * 1000 * 1000
+const WOBJECT_BASE_SIZE = 4
+
+const CACHE_START_EVICTION_SIZE_LIMIT = 20 * 1024 * 1024 * 1024 // 30 GB
+const CACHE_LIGHT_EVICTION_SIZE_LIMIT = 40 * 1024 * 1024 * 1024 // 50 GB
+const CACHE_SOFT_EVICTION_SIZE_LIMIT = 70 * 1024 * 1024 * 1024 // 80 GB
+const CACHE_HARD_EVICTION_SIZE_LIMIT = 150 * 1024 * 1024 * 1024 // 160 GB

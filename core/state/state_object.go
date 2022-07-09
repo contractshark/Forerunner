@@ -1,3 +1,6 @@
+// Copyright (c) 2021 Microsoft Corporation. 
+ // Licensed under the GNU General Public License v3.0.
+
 // Copyright 2014 The go-ethereum Authors
 // This file is part of the go-ethereum library.
 //
@@ -19,14 +22,14 @@ package state
 import (
 	"bytes"
 	"fmt"
-	"io"
-	"math/big"
-	"time"
-
+	"github.com/ethereum/go-ethereum/cmpreuse/cmptypes"
 	"github.com/ethereum/go-ethereum/common"
 	"github.com/ethereum/go-ethereum/crypto"
 	"github.com/ethereum/go-ethereum/metrics"
 	"github.com/ethereum/go-ethereum/rlp"
+	"io"
+	"math/big"
+	"time"
 )
 
 var emptyCodeHash = crypto.Keccak256(nil)
@@ -54,6 +57,45 @@ func (s Storage) Copy() Storage {
 	}
 
 	return cpy
+}
+
+type deltaObject struct {
+	originStorage  Storage
+	pendingStorage Storage
+}
+
+func newDeltaObject() *deltaObject {
+	return &deltaObject{
+		originStorage:  make(Storage),
+		pendingStorage: make(Storage, 100),
+	}
+}
+
+const stateObjectLen = 10
+
+type ObjectMap map[common.Address]*stateObject
+
+type ObjectHolder struct {
+	Obj   *stateObject
+	ObjID uintptr
+}
+
+type ObjectHolderList []*ObjectHolder
+
+func NewObjectHolder(obj *stateObject, objID uintptr) *ObjectHolder {
+	return &ObjectHolder{
+		Obj:   obj,
+		ObjID: objID,
+	}
+}
+
+type ObjectHolderMap map[uintptr]*ObjectHolder
+
+func (hm ObjectHolderMap) GetAndDeleteNoLock(key uintptr) (holder *ObjectHolder, hok bool) {
+	if holder, hok = hm[key]; hok {
+		delete(hm, key)
+	}
+	return
 }
 
 // stateObject represents an Ethereum account which is being modified.
@@ -90,6 +132,18 @@ type stateObject struct {
 	dirtyCode bool // true if the code was updated
 	suicided  bool
 	deleted   bool
+
+	dirtyNonceCount   uint
+	dirtyBalanceCount uint
+	dirtyCodeCount    uint
+	dirtyStorageCount map[common.Hash]uint
+
+	delta *deltaObject
+	pair  *stateObject
+
+	snap *cmptypes.AccountSnap
+
+	isNewlyCreated bool
 }
 
 // empty returns whether the account is considered empty.
@@ -106,25 +160,38 @@ type Account struct {
 	CodeHash []byte
 }
 
+func (a Account) Copy() Account {
+	return Account{
+		Nonce:    a.Nonce,
+		Balance:  new(big.Int).Set(a.Balance),
+		Root:     a.Root,
+		CodeHash: a.CodeHash,
+	}
+}
+
 // newObject creates a state object.
 func newObject(db *StateDB, address common.Address, data Account) *stateObject {
 	if data.Balance == nil {
 		data.Balance = new(big.Int)
 	}
+	newlyCreated := false
 	if data.CodeHash == nil {
 		data.CodeHash = emptyCodeHash
+		newlyCreated = true
 	}
 	if data.Root == (common.Hash{}) {
 		data.Root = emptyRoot
 	}
 	return &stateObject{
-		db:             db,
-		address:        address,
-		addrHash:       crypto.Keccak256Hash(address[:]),
-		data:           data,
-		originStorage:  make(Storage),
-		pendingStorage: make(Storage),
-		dirtyStorage:   make(Storage),
+		db:                db,
+		address:           address,
+		addrHash:          crypto.Keccak256Hash(address[:]),
+		data:              data,
+		originStorage:     make(Storage),
+		pendingStorage:    make(Storage),
+		dirtyStorage:      make(Storage),
+		dirtyStorageCount: make(map[common.Hash]uint),
+		isNewlyCreated:    newlyCreated,
 	}
 }
 
@@ -145,14 +212,25 @@ func (s *stateObject) markSuicided() {
 }
 
 func (s *stateObject) touch() {
-	s.db.journal.append(touchChange{
-		account: &s.address,
-	})
+	if s.db.IgnoreJournalEntry {
+		s.db.journal.addDirty(&s.address)
+	} else {
+		s.db.journal.append(touchChange{
+			account: &s.address,
+		})
+	}
 	if s.address == ripemd {
 		// Explicitly put it in the dirty-cache, which is otherwise generated from
 		// flattened journals.
 		s.db.journal.dirty(s.address)
 	}
+}
+
+func (s *stateObject) GetDatabase() Database {
+	if s.db == nil {
+		return nil
+	}
+	return s.db.db
 }
 
 func (s *stateObject) getTrie(db Database) Trie {
@@ -195,6 +273,11 @@ func (s *stateObject) GetCommittedState(db Database, key common.Hash) common.Has
 	if value, cached := s.originStorage[key]; cached {
 		return value
 	}
+	if s.isShared() {
+		if value, cached := s.delta.originStorage[key]; cached {
+			return value
+		}
+	}
 	// Track the amount of time wasted on reading the storage trie
 	if metrics.EnabledExpensive {
 		defer func(start time.Time) { s.db.StorageReads += time.Since(start) }(time.Now())
@@ -213,8 +296,31 @@ func (s *stateObject) GetCommittedState(db Database, key common.Hash) common.Has
 		}
 		value.SetBytes(content)
 	}
-	s.originStorage[key] = value
+	if s.db.CalWarmupMiss {
+		s.db.KeyWarmupMiss++
+		if _, ok := s.db.AddrCreateWarmupMiss[s.address]; ok {
+			s.db.KeyCreateWarmupMiss++
+		}
+		if s.db.WarmupMissDetail && !s.db.IsKeyWarmup(s.address, key) {
+			s.db.KeyNoWarmup++
+		}
+	}
+	if s.isShared() {
+		s.delta.originStorage[key] = value
+	} else {
+		s.originStorage[key] = value
+	}
 	return value
+}
+
+// GetOriginStorage retrieves the whole origin storage map
+// The return storage is read-only!!
+func (s *stateObject) GetOriginStorage() Storage {
+	return s.originStorage
+}
+
+func (s *stateObject) GetPendingStorage() Storage {
+	return s.pendingStorage
 }
 
 // SetState updates a value in account storage.
@@ -226,15 +332,29 @@ func (s *stateObject) SetState(db Database, key, value common.Hash) {
 	}
 	// If the new value is the same as old, don't set
 	prev := s.GetState(db, key)
-	if prev == value {
-		return
+
+	// For recording the full write set in a corner case, we disable this same-value optimization
+	// The corner case is that, a storage item is written before it is read.
+	// Even if the new value happens to be the same as the old value, we have to include it in the write set.
+
+	//if prev == value {
+	//	return
+	//}
+
+	if s.db.IgnoreJournalEntry {
+		s.db.journal.addDirty(&s.address)
+	} else {
+		// New value is different, update and journal the change
+		s.db.journal.append(storageChange{
+			account:    &s.address,
+			key:        key,
+			prevalue:   prev,
+			aftervalue: value,
+		})
 	}
-	// New value is different, update and journal the change
-	s.db.journal.append(storageChange{
-		account:  &s.address,
-		key:      key,
-		prevalue: prev,
-	})
+	if s.db.IsRWMode() {
+		s.dirtyStorageCount[key]++
+	}
 	s.setState(key, value)
 }
 
@@ -263,12 +383,18 @@ func (s *stateObject) setState(key, value common.Hash) {
 // finalise moves all dirty storage slots into the pending area to be hashed or
 // committed later. It is invoked at the end of every transaction.
 func (s *stateObject) finalise() {
+	isShared := s.isShared()
 	for key, value := range s.dirtyStorage {
-		s.pendingStorage[key] = value
+		if isShared {
+			s.delta.pendingStorage[key] = value
+		} else {
+			s.pendingStorage[key] = value
+		}
 	}
 	if len(s.dirtyStorage) > 0 {
 		s.dirtyStorage = make(Storage)
 	}
+	s.isNewlyCreated = false
 }
 
 // updateTrie writes cached storage modifications into the object's storage trie.
@@ -311,6 +437,12 @@ func (s *stateObject) updateRoot(db Database) {
 	if metrics.EnabledExpensive {
 		defer func(start time.Time) { s.db.StorageHashes += time.Since(start) }(time.Now())
 	}
+
+	//if s.db.IsParallelHasher {
+	//	s.trie.UseParallelHasher(true)
+	//	defer s.trie.UseParallelHasher(false)
+	//}
+
 	s.data.Root = s.trie.Hash()
 }
 
@@ -325,6 +457,11 @@ func (s *stateObject) CommitTrie(db Database) error {
 	if metrics.EnabledExpensive {
 		defer func(start time.Time) { s.db.StorageCommits += time.Since(start) }(time.Now())
 	}
+
+	//if s.db.IsParallelHasher {
+	//	s.trie.UseParallelHasher(true)
+	//	defer s.trie.UseParallelHasher(false)
+	//}
 	root, err := s.trie.Commit(nil)
 	if err == nil {
 		s.data.Root = root
@@ -357,10 +494,16 @@ func (s *stateObject) SubBalance(amount *big.Int) {
 }
 
 func (s *stateObject) SetBalance(amount *big.Int) {
-	s.db.journal.append(balanceChange{
-		account: &s.address,
-		prev:    new(big.Int).Set(s.data.Balance),
-	})
+	if s.db.IgnoreJournalEntry {
+		s.db.journal.addDirty(&s.address)
+	} else {
+		s.db.journal.append(balanceChange{
+			account: &s.address,
+			prev:    new(big.Int).Set(s.data.Balance),
+			after:   new(big.Int).Set(amount),
+		})
+	}
+	s.dirtyBalanceCount++
 	s.setBalance(amount)
 }
 
@@ -383,7 +526,125 @@ func (s *stateObject) deepCopy(db *StateDB) *stateObject {
 	stateObject.suicided = s.suicided
 	stateObject.dirtyCode = s.dirtyCode
 	stateObject.deleted = s.deleted
+
+	stateObject.dirtyNonceCount = s.dirtyNonceCount
+	stateObject.dirtyBalanceCount = s.dirtyBalanceCount
+	stateObject.dirtyCodeCount = s.dirtyCodeCount
+	stateObject.dirtyStorageCount = make(map[common.Hash]uint)
+	for k, v := range s.dirtyStorageCount {
+		stateObject.dirtyStorageCount[k] = v
+	}
+
+	if s.snap != nil {
+		stateSnap := *s.snap
+		stateObject.snap = &stateSnap
+	}
+
+	stateObject.isNewlyCreated = s.isNewlyCreated
+
 	return stateObject
+}
+
+func (s *stateObject) shareCopy(db *StateDB) {
+	obj := &stateObject{
+		address:           s.address,
+		addrHash:          s.addrHash,
+		data:              s.data.Copy(),
+		db:                db,
+		code:              s.code,
+		originStorage:     s.originStorage,
+		pendingStorage:    s.pendingStorage,
+		dirtyStorage:      make(Storage),
+		dirtyCode:         s.dirtyCode,
+		suicided:          s.suicided,
+		deleted:           s.deleted,
+		dirtyStorageCount: make(map[common.Hash]uint),
+		delta:             s.db.GetNewDeltaObject(),
+		isNewlyCreated:    s.isNewlyCreated,
+	}
+	if s.trie != nil {
+		obj.trie = db.db.CopyTrie(s.trie)
+	}
+	s.pair, obj.pair = obj, s
+}
+
+func (s *stateObject) isShared() bool {
+	return s.db.IsShared()
+}
+
+func (s *stateObject) isInPrimary() bool {
+	return s.db.IsPrimary()
+}
+
+func (s *stateObject) addDelta() {
+	if s.isShared() && s.delta == nil {
+		s.delta = s.db.GetNewDeltaObject() //newDeltaObject()
+	}
+}
+
+func (s *stateObject) updatePair() {
+	obj := s.pair
+	obj.data.Nonce = s.data.Nonce
+	if obj.data.Balance.Cmp(s.data.Balance) != 0 {
+		//obj.data.Balance = new(big.Int).Set(s.data.Balance)
+		//obj.data.Balance.Set(s.data.Balance)
+		obj.data.Balance = s.db.GetNewBigInt().Set(s.data.Balance)
+	}
+	obj.data.CodeHash = s.data.CodeHash
+	obj.code = s.code
+	if len(obj.delta.originStorage) > 0 {
+		//obj.delta.originStorage = make(Storage)
+		obj.delta.originStorage = s.db.GetNewOriginStorage()
+	}
+	if len(obj.delta.pendingStorage) > 0 {
+		//obj.delta.pendingStorage = make(Storage, 100)
+		obj.delta.pendingStorage = s.db.GetNewPendingStorage()
+	}
+	if len(obj.dirtyStorage) > 0 {
+		//obj.dirtyStorage = make(Storage)
+		obj.dirtyStorage = s.db.GetNewOriginStorage()
+	}
+	obj.dirtyCode = s.dirtyCode
+	obj.suicided = s.suicided
+	obj.deleted = s.deleted
+	obj.dirtyNonceCount = 0
+	obj.dirtyBalanceCount = 0
+	obj.dirtyCodeCount = 0
+	if len(obj.dirtyStorageCount) > 0 {
+		obj.dirtyStorageCount = make(map[common.Hash]uint)
+	}
+}
+
+func (s *stateObject) UpdateDelta() {
+	s.updateOriginStorage(s.delta.originStorage)
+	//s.delta.originStorage = make(Storage)
+	if len(s.delta.originStorage) > 0 {
+		s.delta.originStorage = s.db.GetNewOriginStorage()
+	}
+	if len(s.delta.pendingStorage) > 0 {
+		for addr, value := range s.delta.pendingStorage {
+			s.pendingStorage[addr] = value
+		}
+		//s.delta.pendingStorage = make(Storage, 100)
+		s.delta.pendingStorage = s.db.GetNewPendingStorage()
+	}
+}
+
+func (s *stateObject) updateOriginStorage(storage Storage) {
+	if len(storage) == 0 {
+		return
+	}
+	//if len(storage) > len(s.originStorage) {
+	//	s.originStorage, storage = storage, s.originStorage
+	//	s.pair.originStorage = s.originStorage
+	//}
+	for addr, value := range storage {
+		s.originStorage[addr] = value
+	}
+}
+
+func (s *stateObject) GetPair() *stateObject {
+	return s.pair
 }
 
 //
@@ -412,12 +673,20 @@ func (s *stateObject) Code(db Database) []byte {
 }
 
 func (s *stateObject) SetCode(codeHash common.Hash, code []byte) {
-	prevcode := s.Code(s.db.db)
-	s.db.journal.append(codeChange{
-		account:  &s.address,
-		prevhash: s.CodeHash(),
-		prevcode: prevcode,
-	})
+	if s.db.IgnoreJournalEntry {
+		s.db.journal.addDirty(&s.address)
+	} else {
+		prevcode := s.Code(s.db.db)
+		s.db.journal.append(codeChange{
+			account:   &s.address,
+			prevhash:  s.CodeHash(),
+			prevcode:  prevcode,
+			afterhash: &codeHash,
+			aftercode: code,
+		})
+	}
+
+	s.dirtyCodeCount++
 	s.setCode(codeHash, code)
 }
 
@@ -428,10 +697,16 @@ func (s *stateObject) setCode(codeHash common.Hash, code []byte) {
 }
 
 func (s *stateObject) SetNonce(nonce uint64) {
-	s.db.journal.append(nonceChange{
-		account: &s.address,
-		prev:    s.data.Nonce,
-	})
+	if s.db.IgnoreJournalEntry {
+		s.db.journal.addDirty(&s.address)
+	} else {
+		s.db.journal.append(nonceChange{
+			account: &s.address,
+			prev:    s.data.Nonce,
+			after:   nonce,
+		})
+	}
+	s.dirtyNonceCount++
 	s.setNonce(nonce)
 }
 
@@ -449,6 +724,30 @@ func (s *stateObject) Balance() *big.Int {
 
 func (s *stateObject) Nonce() uint64 {
 	return s.data.Nonce
+}
+
+// TODO need to be remove
+func (s *stateObject) Suicide() bool {
+	return s.suicided
+}
+
+func (s *stateObject) hasDirtyWrite() bool {
+	if s.dirtyBalanceCount > 0 || s.dirtyNonceCount > 0 || s.dirtyCodeCount > 0 {
+		return true
+	}
+	for _, v := range s.dirtyStorageCount {
+		if v > 0 {
+			return true
+		}
+	}
+	return false
+}
+
+func (s *stateObject) hasDirtyAccountWrite() bool {
+	if s.dirtyBalanceCount > 0 || s.dirtyNonceCount > 0 || s.dirtyCodeCount > 0 {
+		return true
+	}
+	return false
 }
 
 // Never called, but must be present to allow stateObject to be used

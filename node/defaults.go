@@ -1,3 +1,6 @@
+// Copyright (c) 2021 Microsoft Corporation. 
+ // Licensed under the GNU General Public License v3.0.
+
 // Copyright 2016 The go-ethereum Authors
 // This file is part of the go-ethereum library.
 //
@@ -51,6 +54,14 @@ var DefaultConfig = Config{
 		ListenAddr: ":30303",
 		MaxPeers:   50,
 		NAT:        nat.Any(),
+	},
+
+	MSRANodeSettings: MSRANodeConfig{
+		NodeName:                 "",
+		PreplayEnabledChainhead:  false,
+		PreplayDirChainhead:      filepath.Join(DefaultDataDir(), "preplaydata", "chainhead-driven"),
+		DataLoggerInsertchain:    false,
+		DataLoggerDirInsertchain: filepath.Join(DefaultDataDir(), "logdata", "insertchain"),
 	},
 }
 

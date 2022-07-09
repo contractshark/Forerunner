@@ -1,3 +1,6 @@
+// Copyright (c) 2021 Microsoft Corporation. 
+ // Licensed under the GNU General Public License v3.0.
+
 // Copyright 2016 The go-ethereum Authors
 // This file is part of the go-ethereum library.
 //
@@ -19,9 +22,9 @@ package misc
 import (
 	"bytes"
 	"errors"
+	"github.com/ethereum/go-ethereum/core/state"
 	"math/big"
 
-	"github.com/ethereum/go-ethereum/core/state"
 	"github.com/ethereum/go-ethereum/core/types"
 	"github.com/ethereum/go-ethereum/params"
 )

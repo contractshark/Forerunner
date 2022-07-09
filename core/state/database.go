@@ -1,3 +1,6 @@
+// Copyright (c) 2021 Microsoft Corporation. 
+ // Licensed under the GNU General Public License v3.0.
+
 // Copyright 2017 The go-ethereum Authors
 // This file is part of the go-ethereum library.
 //
@@ -70,6 +73,11 @@ type Trie interface {
 	// database, a trie.MissingNodeError is returned.
 	TryUpdate(key, value []byte) error
 
+	// These two are for parallelization
+	TryUpdateWithHashedKey(key, hashedKey, value []byte) error
+	HashKey(key []byte) []byte
+    TryInsertInBatch(keyCopyList, hexKeyList, valueList [][]byte, hashedKeyStringList []string) error
+
 	// TryDelete removes any existing value for key from the trie. If a node was not
 	// found in the database, a trie.MissingNodeError is returned.
 	TryDelete(key []byte) error
@@ -81,6 +89,8 @@ type Trie interface {
 	// Commit writes all nodes to the trie's memory database, tracking the internal
 	// and external (for account tries) references.
 	Commit(onleaf trie.LeafCallback) (common.Hash, error)
+
+	UseParallelHasher(on bool)
 
 	// NodeIterator returns an iterator that returns nodes of the trie. Iteration
 	// starts at the key after the given start key.

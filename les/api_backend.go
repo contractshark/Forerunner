@@ -1,3 +1,6 @@
+// Copyright (c) 2021 Microsoft Corporation. 
+ // Licensed under the GNU General Public License v3.0.
+
 // Copyright 2016 The go-ethereum Authors
 // This file is part of the go-ethereum library.
 //
@@ -20,6 +23,9 @@ import (
 	"context"
 	"errors"
 	"math/big"
+
+	"github.com/ethereum/go-ethereum/optipreplayer"
+	"github.com/ethereum/go-ethereum/optipreplayer/cache"
 
 	"github.com/ethereum/go-ethereum/accounts"
 	"github.com/ethereum/go-ethereum/common"
@@ -273,4 +279,12 @@ func (b *LesApiBackend) ServiceFilter(ctx context.Context, session *bloombits.Ma
 	for i := 0; i < bloomFilterThreads; i++ {
 		go session.Multiplex(bloomRetrievalBatch, bloomRetrievalWait, b.eth.bloomRequests)
 	}
+}
+
+func (b *LesApiBackend) GetPreplayer(pID uint64) *optipreplayer.Preplayer {
+	return &optipreplayer.Preplayer{}
+}
+
+func (b *LesApiBackend) GetGlobalCache() *cache.GlobalCache {
+	return &cache.GlobalCache{}
 }

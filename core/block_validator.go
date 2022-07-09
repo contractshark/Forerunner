@@ -1,3 +1,6 @@
+// Copyright (c) 2021 Microsoft Corporation. 
+ // Licensed under the GNU General Public License v3.0.
+
 // Copyright 2015 The go-ethereum Authors
 // This file is part of the go-ethereum library.
 //
@@ -18,10 +21,10 @@ package core
 
 import (
 	"fmt"
-
 	"github.com/ethereum/go-ethereum/consensus"
 	"github.com/ethereum/go-ethereum/core/state"
 	"github.com/ethereum/go-ethereum/core/types"
+	"github.com/ethereum/go-ethereum/log"
 	"github.com/ethereum/go-ethereum/params"
 )
 
@@ -66,6 +69,8 @@ func (v *BlockValidator) ValidateBody(block *types.Block) error {
 	}
 	if !v.bc.HasBlockAndState(block.ParentHash(), block.NumberU64()-1) {
 		if !v.bc.HasBlock(block.ParentHash(), block.NumberU64()-1) {
+
+			log.Warn("there is an unknown ancestor from validateBody")
 			return consensus.ErrUnknownAncestor
 		}
 		return consensus.ErrPrunedAncestor
@@ -84,7 +89,13 @@ func (v *BlockValidator) ValidateState(block *types.Block, statedb *state.StateD
 	}
 	// Validate the received block's bloom with the one derived from the generated receipts.
 	// For valid blocks this should always validate to true.
-	rbloom := types.CreateBloom(receipts)
+	var rbloom types.Bloom
+	if statedb.BloomProcessor != nil {
+		rbloom = statedb.BloomProcessor.GetBloomForCurrentBlock()
+	}else{
+		rbloom = types.CreateBloom(receipts)
+	}
+
 	if rbloom != header.Bloom {
 		return fmt.Errorf("invalid bloom (remote: %x  local: %x)", header.Bloom, rbloom)
 	}

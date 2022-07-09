@@ -1,3 +1,6 @@
+// Copyright (c) 2021 Microsoft Corporation. 
+ // Licensed under the GNU General Public License v3.0.
+
 // Copyright 2014 The go-ethereum Authors
 // This file is part of the go-ethereum library.
 //
@@ -74,6 +77,10 @@ func keybytesToHex(str []byte) []byte {
 	}
 	nibbles[l-1] = 16
 	return nibbles
+}
+
+func KeybytesToHex(str []byte) []byte {
+	return keybytesToHex(str)
 }
 
 // hexToKeybytes turns hex nibbles into key bytes.

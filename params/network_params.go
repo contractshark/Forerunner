@@ -1,3 +1,6 @@
+// Copyright (c) 2021 Microsoft Corporation. 
+ // Licensed under the GNU General Public License v3.0.
+
 // Copyright 2017 The go-ethereum Authors
 // This file is part of the go-ethereum library.
 //
@@ -58,4 +61,6 @@ const (
 	// hard limit against deep ancestors, by the blockchain against deep reorgs, by
 	// the freezer as the cutoff treshold and by clique as the snapshot trust limit.
 	ImmutabilityThreshold = 90000
+
+	MSRAFreezerCutoff = 90000 * 24 // around a year
 )

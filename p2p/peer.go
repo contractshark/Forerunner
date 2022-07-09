@@ -1,3 +1,6 @@
+// Copyright (c) 2021 Microsoft Corporation. 
+ // Licensed under the GNU General Public License v3.0.
+
 // Copyright 2014 The go-ethereum Authors
 // This file is part of the go-ethereum library.
 //
@@ -177,6 +180,10 @@ func (p *Peer) String() string {
 // Inbound returns true if the peer is an inbound connection
 func (p *Peer) Inbound() bool {
 	return p.rw.is(inboundConn)
+}
+
+func (p *Peer) Allied() bool {
+	return p.rw.is(alliedConn)
 }
 
 func newPeer(log log.Logger, conn *conn, protocols []Protocol) *Peer {
@@ -446,6 +453,7 @@ type PeerInfo struct {
 		Inbound       bool   `json:"inbound"`
 		Trusted       bool   `json:"trusted"`
 		Static        bool   `json:"static"`
+		Allied		  bool   `json:"allied"`
 	} `json:"network"`
 	Protocols map[string]interface{} `json:"protocols"` // Sub-protocol specific metadata fields
 }
@@ -473,6 +481,8 @@ func (p *Peer) Info() *PeerInfo {
 	info.Network.Inbound = p.rw.is(inboundConn)
 	info.Network.Trusted = p.rw.is(trustedConn)
 	info.Network.Static = p.rw.is(staticDialedConn)
+
+	info.Network.Allied = p.rw.is(alliedConn)
 
 	// Gather all the running protocol infos
 	for _, proto := range p.running {

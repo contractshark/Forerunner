@@ -1,3 +1,6 @@
+// Copyright (c) 2021 Microsoft Corporation. 
+ // Licensed under the GNU General Public License v3.0.
+
 // Copyright 2016 The go-ethereum Authors
 // This file is part of the go-ethereum library.
 //
@@ -17,6 +20,7 @@
 package vm
 
 import (
+	"github.com/ethereum/go-ethereum/core/state"
 	"math/big"
 
 	"github.com/ethereum/go-ethereum/common"
@@ -64,6 +68,11 @@ type StateDB interface {
 	AddPreimage(common.Hash, []byte)
 
 	ForEachStorage(common.Address, func(common.Hash, common.Hash) bool) error
+
+	// MSRA needed interface
+	// The following is not belong to the origin interface.
+	RWRecorder() state.RWRecorder
+	IsEnableFeeToCoinbase() bool
 }
 
 // CallContext provides a basic interface for the EVM calling conventions. The EVM

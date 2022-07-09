@@ -1,3 +1,6 @@
+// Copyright (c) 2021 Microsoft Corporation. 
+ // Licensed under the GNU General Public License v3.0.
+
 // Copyright 2014 The go-ethereum Authors
 // This file is part of the go-ethereum library.
 //
@@ -18,6 +21,7 @@ package vm
 
 import (
 	"fmt"
+	"github.com/ethereum/go-ethereum/cmpreuse/cmptypes"
 	"math/big"
 )
 
@@ -25,7 +29,8 @@ import (
 // expected to be changed and modified. stack does not take care of adding newly
 // initialised objects.
 type Stack struct {
-	data []*big.Int
+	data    []*big.Int
+	RTracer cmptypes.IReuseTracer
 }
 
 func newstack() *Stack {

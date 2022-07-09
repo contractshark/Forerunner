@@ -1,3 +1,6 @@
+// Copyright (c) 2021 Microsoft Corporation. 
+ // Licensed under the GNU General Public License v3.0.
+
 // Copyright 2014 The go-ethereum Authors
 // This file is part of the go-ethereum library.
 //
@@ -23,6 +26,13 @@ import (
 
 // NewTxsEvent is posted when a batch of transactions enter the transaction pool.
 type NewTxsEvent struct{ Txs []*types.Transaction }
+
+// ListenTxsEvent is posted when a batch of transactions are listened.
+type ListenTxsEvent NewTxsEvent
+// ListenTxsEvent is posted when a batch of transactions are listened.
+type EnpoolTxsEvent NewTxsEvent
+// ListenTxsEvent is posted when a batch of transactions are listened.
+type EnpendingTxsEvent NewTxsEvent
 
 // PendingLogsEvent is posted pre mining and notifies of pending logs.
 type PendingLogsEvent struct {

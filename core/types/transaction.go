@@ -1,3 +1,6 @@
+// Copyright (c) 2021 Microsoft Corporation. 
+ // Licensed under the GNU General Public License v3.0.
+
 // Copyright 2014 The go-ethereum Authors
 // This file is part of the go-ethereum library.
 //
@@ -26,6 +29,7 @@ import (
 	"github.com/ethereum/go-ethereum/common"
 	"github.com/ethereum/go-ethereum/common/hexutil"
 	"github.com/ethereum/go-ethereum/crypto"
+	"github.com/ethereum/go-ethereum/log"
 	"github.com/ethereum/go-ethereum/rlp"
 )
 
@@ -58,6 +62,7 @@ type txdata struct {
 
 	// This is only used when marshaling to JSON.
 	Hash *common.Hash `json:"hash" rlp:"-"`
+	From *string      `json:"from" rlp:"-"`
 }
 
 type txdataMarshaling struct {
@@ -144,6 +149,13 @@ func (tx *Transaction) MarshalJSON() ([]byte, error) {
 	hash := tx.Hash()
 	data := tx.data
 	data.Hash = &hash
+	// Mainnet ChainID
+	from, err := Sender(NewEIP155Signer(big.NewInt(1)), tx)
+	if err != nil {
+		log.Error("Error while get tx from", "err", err)
+	}
+	fromHash := "0x" + from.Hash().Hex()[26:]
+	data.From = &fromHash
 	return data.MarshalJSON()
 }
 
@@ -178,6 +190,10 @@ func (tx *Transaction) GasPrice() *big.Int { return new(big.Int).Set(tx.data.Pri
 func (tx *Transaction) Value() *big.Int    { return new(big.Int).Set(tx.data.Amount) }
 func (tx *Transaction) Nonce() uint64      { return tx.data.AccountNonce }
 func (tx *Transaction) CheckNonce() bool   { return true }
+
+func (tx *Transaction) GasPriceU64() uint64             { return tx.data.Price.Uint64() }
+func (tx *Transaction) CmpGasPrice(price2 *big.Int) int { return tx.data.Price.Cmp(price2) }
+func (tx *Transaction) CmpGasPriceWithTxn(tx2 *Transaction) int { return tx.data.Price.Cmp(tx2.data.Price) }
 
 // To returns the recipient address of the transaction.
 // It returns nil if the transaction is a contract creation.
@@ -226,6 +242,7 @@ func (tx *Transaction) AsMessage(s Signer) (Message, error) {
 		amount:     tx.data.Amount,
 		data:       tx.data.Payload,
 		checkNonce: true,
+		hash:       tx.Hash(),
 	}
 
 	var err error
@@ -291,6 +308,25 @@ func TxDifference(a, b Transactions) Transactions {
 	return keep
 }
 
+func IsTxnsPoolLarge(a, b Transactions) bool {
+	if a.Len() > b.Len() {
+		return true
+	}
+
+	remove := make(map[common.Hash]struct{})
+	for _, tx := range b {
+		remove[tx.Hash()] = struct{}{}
+	}
+
+	for _, tx := range a {
+		if _, ok := remove[tx.Hash()]; !ok {
+			return true
+		}
+	}
+
+	return false
+}
+
 // TxByNonce implements the sort interface to allow sorting a list of transactions
 // by their nonces. This is usually only useful for sorting transactions from a
 // single account, otherwise a nonce comparison doesn't make much sense.
@@ -302,21 +338,34 @@ func (s TxByNonce) Swap(i, j int)      { s[i], s[j] = s[j], s[i] }
 
 // TxByPrice implements both the sort and the heap interface, making it useful
 // for all at once sorting as well as individually adding and removing elements.
-type TxByPrice Transactions
+type TxByPrice struct {
+	Txns     Transactions
+	TxnOrder map[common.Hash]int
+}
 
-func (s TxByPrice) Len() int           { return len(s) }
-func (s TxByPrice) Less(i, j int) bool { return s[i].data.Price.Cmp(s[j].data.Price) > 0 }
-func (s TxByPrice) Swap(i, j int)      { s[i], s[j] = s[j], s[i] }
+func (s TxByPrice) Len() int { return len(s.Txns) }
+func (s TxByPrice) Less(i, j int) bool {
+	cmp := s.Txns[i].data.Price.Cmp(s.Txns[j].data.Price)
+	if s.TxnOrder != nil && cmp == 0 {
+		iOrder, iOk := s.TxnOrder[s.Txns[i].Hash()]
+		jOrder, jOk := s.TxnOrder[s.Txns[j].Hash()]
+		if iOk && jOk {
+			return iOrder < jOrder
+		}
+	}
+	return cmp > 0
+}
+func (s TxByPrice) Swap(i, j int) { s.Txns[i], s.Txns[j] = s.Txns[j], s.Txns[i] }
 
 func (s *TxByPrice) Push(x interface{}) {
-	*s = append(*s, x.(*Transaction))
+	s.Txns = append(s.Txns, x.(*Transaction))
 }
 
 func (s *TxByPrice) Pop() interface{} {
-	old := *s
+	old := s.Txns
 	n := len(old)
 	x := old[n-1]
-	*s = old[0 : n-1]
+	s.Txns = old[0 : n-1]
 	return x
 }
 
@@ -327,6 +376,7 @@ type TransactionsByPriceAndNonce struct {
 	txs    map[common.Address]Transactions // Per account nonce-sorted list of transactions
 	heads  TxByPrice                       // Next transaction for each unique account (price heap)
 	signer Signer                          // Signer for the set of transactions
+	// total  int                             // Total number for the set of transactions
 }
 
 // NewTransactionsByPriceAndNonce creates a transaction set that can retrieve
@@ -334,16 +384,24 @@ type TransactionsByPriceAndNonce struct {
 //
 // Note, the input map is reowned so the caller should not interact any more with
 // if after providing it to the constructor.
-func NewTransactionsByPriceAndNonce(signer Signer, txs map[common.Address]Transactions) *TransactionsByPriceAndNonce {
+func NewTransactionsByPriceAndNonce(signer Signer, txs map[common.Address]Transactions, txnOrder map[common.Hash]int, fast bool) *TransactionsByPriceAndNonce {
 	// Initialize a price based heap with the head transactions
-	heads := make(TxByPrice, 0, len(txs))
+	// total := len(txs)
+	heads := TxByPrice{
+		Txns:     make(Transactions, 0, len(txs)),
+		TxnOrder: txnOrder,
+	}
 	for from, accTxs := range txs {
-		heads = append(heads, accTxs[0])
-		// Ensure the sender address is from the signer
-		acc, _ := Sender(signer, accTxs[0])
-		txs[acc] = accTxs[1:]
-		if from != acc {
-			delete(txs, from)
+		heads.Txns = append(heads.Txns, accTxs[0])
+		if fast {
+			txs[from] = accTxs[1:]
+		} else {
+			// Ensure the sender address is from the signer
+			acc, _ := Sender(signer, accTxs[0])
+			txs[acc] = accTxs[1:]
+			if from != acc {
+				delete(txs, from)
+			}
 		}
 	}
 	heap.Init(&heads)
@@ -353,22 +411,68 @@ func NewTransactionsByPriceAndNonce(signer Signer, txs map[common.Address]Transa
 		txs:    txs,
 		heads:  heads,
 		signer: signer,
+		// total:  total,
 	}
 }
 
+// func NewPreplayTransactionsByPriceAndNonce(signer Signer, txs map[common.Address]Transactions) *TransactionsByPriceAndNonce {
+// 	// Initialize a price based heap with the head transactions
+// 	total := len(txs)
+// 	heads := make(TxByPrice, 0, len(txs))
+
+// 	froms := common.Addresses{}
+// 	for from := range txs {
+// 		froms = append(froms, from)
+// 	}
+// 	sort.Sort(froms)
+
+// 	for _, from := range froms {
+// 		accTxs := txs[from]
+// 		heads = append(heads, accTxs[0])
+// 		// Ensure the sender address is from the signer
+// 		acc, _ := Sender(signer, accTxs[0])
+// 		txs[acc] = accTxs[1:]
+// 		if from != acc {
+// 			delete(txs, from)
+// 		}
+// 	}
+// 	heap.Init(&heads)
+
+// 	// Assemble and return the transaction set
+// 	return &TransactionsByPriceAndNonce{
+// 		txs:    txs,
+// 		heads:  heads,
+// 		signer: signer,
+// 		total:  total,
+// 	}
+// }
+
+// func (t *TransactionsByPriceAndNonce) GetTxsFromAddress(from common.Address) Transactions {
+// 	return t.txs[from]
+// }
+
+// func (t *TransactionsByPriceAndNonce) GetTxsFromAddressandNonce(from common.Address, nonce uint64) *Transaction {
+// 	for _, tx := range t.txs[from] {
+// 		if tx.Nonce() == nonce {
+// 			return tx
+// 		}
+// 	}
+// 	return nil
+// }
+
 // Peek returns the next transaction by price.
 func (t *TransactionsByPriceAndNonce) Peek() *Transaction {
-	if len(t.heads) == 0 {
+	if len(t.heads.Txns) == 0 {
 		return nil
 	}
-	return t.heads[0]
+	return t.heads.Txns[0]
 }
 
 // Shift replaces the current best head with the next one from the same account.
 func (t *TransactionsByPriceAndNonce) Shift() {
-	acc, _ := Sender(t.signer, t.heads[0])
+	acc, _ := Sender(t.signer, t.heads.Txns[0])
 	if txs, ok := t.txs[acc]; ok && len(txs) > 0 {
-		t.heads[0], t.txs[acc] = txs[0], txs[1:]
+		t.heads.Txns[0], t.txs[acc] = txs[0], txs[1:]
 		heap.Fix(&t.heads, 0)
 	} else {
 		heap.Pop(&t.heads)
@@ -382,6 +486,58 @@ func (t *TransactionsByPriceAndNonce) Pop() {
 	heap.Pop(&t.heads)
 }
 
+// C
+// func (t *TransactionsByPriceAndNonce) Replace(from common.Address, nonce uint64, tx *Transaction) {
+// 	// Search in heap
+// 	// Search in txs
+// 	for idx, tx := range t.txs[from] {
+// 		if tx.Nonce() == nonce {
+// 			t.txs[from][idx] = tx
+// 		}
+// 	}
+// }
+
+// // C: Push transaction into heap.
+func (t *TransactionsByPriceAndNonce) Push(tx *Transaction) {
+	// acc, _ := Sender(t.signer, tx)
+	// if _, ok := t.txs[acc]; !ok {
+	// 	t.txs[acc] = Transactions{}
+	// }
+	// t.txs[acc] = append(t.txs[acc], tx)
+	// if len(t.txs[acc]) == 1 {
+	// 	heap.(&t.heads, tx)
+	// }
+	heap.Push(&t.heads, tx)
+}
+
+// func (t *TransactionsByPriceAndNonce) PushToAccountTxsBack(tx *Transaction) {
+
+// }
+
+// func (t *TransactionsByPriceAndNonce) Heap() TxByPrice {
+// 	return t.heads
+// }
+
+// func (t *TransactionsByPriceAndNonce) IsPasPriceIn(gasPrice *big.Int) bool {
+// 	for _, tx := range t.heads {
+// 		if tx.GasPrice().Cmp(gasPrice) == 0 {
+// 			return true
+// 		}
+// 	}
+// 	for _, txs := range t.txs {
+// 		for _, tx := range txs {
+// 			if tx.GasPrice().Cmp(gasPrice) == 0 {
+// 				return true
+// 			}
+// 		}
+// 	}
+// 	return false
+// }
+
+// func (t *TransactionsByPriceAndNonce) Total() int {
+// 	return t.total
+// }
+
 // Message is a fully derived transaction and implements core.Message
 //
 // NOTE: In a future PR this will be removed.
@@ -394,6 +550,7 @@ type Message struct {
 	gasPrice   *big.Int
 	data       []byte
 	checkNonce bool
+	hash       common.Hash
 }
 
 func NewMessage(from common.Address, to *common.Address, nonce uint64, amount *big.Int, gasLimit uint64, gasPrice *big.Int, data []byte, checkNonce bool) Message {
@@ -417,3 +574,4 @@ func (m Message) Gas() uint64          { return m.gasLimit }
 func (m Message) Nonce() uint64        { return m.nonce }
 func (m Message) Data() []byte         { return m.data }
 func (m Message) CheckNonce() bool     { return m.checkNonce }
+func (m Message) Hash() common.Hash    { return m.hash }

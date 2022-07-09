@@ -1,3 +1,6 @@
+// Copyright (c) 2021 Microsoft Corporation.
+// Licensed under the GNU General Public License v3.0.
+
 // Copyright 2014 The go-ethereum Authors
 // This file is part of the go-ethereum library.
 //
@@ -18,16 +21,22 @@
 package core
 
 import (
+	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
 	"math/big"
 	mrand "math/rand"
+	"os"
+	"runtime"
+	"runtime/debug"
 	"sort"
+	"strconv"
 	"sync"
 	"sync/atomic"
 	"time"
 
+	"github.com/ethereum/go-ethereum/cmpreuse/cmptypes"
 	"github.com/ethereum/go-ethereum/common"
 	"github.com/ethereum/go-ethereum/common/mclock"
 	"github.com/ethereum/go-ethereum/common/prque"
@@ -40,6 +49,7 @@ import (
 	"github.com/ethereum/go-ethereum/event"
 	"github.com/ethereum/go-ethereum/log"
 	"github.com/ethereum/go-ethereum/metrics"
+	"github.com/ethereum/go-ethereum/optipreplayer/cache"
 	"github.com/ethereum/go-ethereum/params"
 	"github.com/ethereum/go-ethereum/rlp"
 	"github.com/ethereum/go-ethereum/trie"
@@ -177,6 +187,20 @@ type BlockChain struct {
 	badBlocks       *lru.Cache                     // Bad block cache
 	shouldPreserve  func(*types.Block) bool        // Function used to determine whether should preserve the given block.
 	terminateInsert func(common.Hash, uint64) bool // Testing hook used to terminate ancient receipt chain insertion.
+
+	// MSRA
+	Cmpreuse        TransactionApplier
+	MSRACache       *cache.GlobalCache
+	Warmuper        *Warmuper
+	execTimeList    ExecTimeList
+	ReportReuseMiss cache.MissReporter
+	asyncWriteWg    sync.WaitGroup
+
+	InsertChainRecorder InsertChainRecorder
+
+	EmulateHook  rawdb.EmulateHook
+	blockLogFile *os.File
+	txLogFile    *os.File
 }
 
 // NewBlockChain returns a fully initialised block chain using information
@@ -215,10 +239,14 @@ func NewBlockChain(db ethdb.Database, cacheConfig *CacheConfig, chainConfig *par
 		engine:         engine,
 		vmConfig:       vmConfig,
 		badBlocks:      badBlocks,
+		//MSRA
+		execTimeList: NewExecTimeList(),
 	}
 	bc.validator = NewBlockValidator(chainConfig, bc, engine)
 	bc.prefetcher = newStatePrefetcher(chainConfig, bc, engine)
 	bc.processor = NewStateProcessor(chainConfig, bc, engine)
+	//MSRA
+	bc.Warmuper = NewWarmuper(bc, bc.vmConfig)
 
 	var err error
 	bc.hc, err = NewHeaderChain(db, chainConfig, engine, bc.getProcInterrupt)
@@ -242,6 +270,25 @@ func NewBlockChain(db ethdb.Database, cacheConfig *CacheConfig, chainConfig *par
 	if err := bc.loadLastState(); err != nil {
 		return nil, err
 	}
+
+	if vmConfig.MSRAVMSettings.FindAllStateFrom != 0 {
+		curBlockNumber := bc.CurrentBlock().NumberU64()
+		cbn := (curBlockNumber - 1) / 1000 * 1000
+		minAVBN := curBlockNumber
+		for i := cbn; i >= vmConfig.MSRAVMSettings.FindAllStateFrom; i -= 1000 {
+			log.Info("Check block state", "blockNumber", i)
+			cb := bc.GetBlockByNumber(i)
+			if _, err := state.New(cb.Root(), bc.stateCache); err != nil {
+				// Dangling block without a state associated, init from scratch
+				log.Warn("Head state missing !!!!!!", "number", cb.Number(), "hash", cb.Hash())
+			}else{
+				minAVBN = i
+			}
+		}
+		log.Info("Min available block ", "blocknumber", minAVBN)
+		return nil, fmt.Errorf("finished")
+	}
+
 	// The first thing the node will do is reconstruct the verification data for
 	// the head block (ethash cache or clique voting snapshot). Might as well do
 	// it in advance.
@@ -271,13 +318,17 @@ func NewBlockChain(db ethdb.Database, cacheConfig *CacheConfig, chainConfig *par
 			}
 		}
 		if needRewind {
-			var hashes []common.Hash
-			previous := bc.CurrentHeader().Number.Uint64()
-			for i := low + 1; i <= bc.CurrentHeader().Number.Uint64(); i++ {
-				hashes = append(hashes, rawdb.ReadCanonicalHash(bc.db, i))
+			if !rawdb.GlobalEmulateHook.IsEmulateMode() {
+				var hashes []common.Hash
+				previous := bc.CurrentHeader().Number.Uint64()
+				for i := low + 1; i <= bc.CurrentHeader().Number.Uint64(); i++ {
+					hashes = append(hashes, rawdb.ReadCanonicalHash(bc.db, i))
+				}
+				bc.Rollback(hashes)
+				log.Warn("Truncate ancient chain", "from", previous, "to", low)
+			} else {
+				log.Error("Prevented truncating ancient chain in emulate mode")
 			}
-			bc.Rollback(hashes)
-			log.Warn("Truncate ancient chain", "from", previous, "to", low)
 		}
 	}
 	// Check the current state of the block hashes and make sure that we do not have any of the bad blocks in our chain
@@ -293,9 +344,53 @@ func NewBlockChain(db ethdb.Database, cacheConfig *CacheConfig, chainConfig *par
 			}
 		}
 	}
+
+	if bc.vmConfig.MSRAVMSettings.PerfLogging {
+		var logFileName = "/tmp/PerfBlockLog.baseline.txt"
+		if bc.vmConfig.MSRAVMSettings.CmpReuse {
+			logFileName = "/tmp/PerfBlockLog.reuse.txt"
+		} else if bc.vmConfig.MSRAVMSettings.EnablePreplay {
+			logFileName = "/tmp/PerfBlockLog.preplay.txt"
+		}
+		f, _ := os.OpenFile(logFileName, os.O_RDWR|os.O_CREATE|os.O_APPEND, os.ModePerm)
+		bc.blockLogFile = f
+
+		logFileName = "/tmp/PerfTxLog.baseline.txt"
+		if bc.vmConfig.MSRAVMSettings.CmpReuse {
+			logFileName = "/tmp/PerfTxLog.reuse.txt"
+		} else if bc.vmConfig.MSRAVMSettings.EnablePreplay {
+			logFileName = "/tmp/PerfTxLog.preplay.txt"
+		}
+
+		f, _ = os.OpenFile(logFileName, os.O_RDWR|os.O_CREATE|os.O_APPEND, os.ModePerm)
+		bc.txLogFile = f
+	}
+
 	// Take ownership of this particular state
 	go bc.update()
+
 	return bc, nil
+}
+
+func (bc *BlockChain) GetMSRAChainSettings() *params.MSRAChainConfig {
+	return &bc.chainConfig.MSRAChainSettings
+}
+
+func (bc *BlockChain) CommitBlockPre(block *types.Block) *cache.BlockPre {
+	if bc.MSRACache != nil {
+		blockPre := cache.NewBlockPre(block)
+		bc.MSRACache.CommitBlockPre(blockPre)
+		return blockPre
+	} else {
+		return nil
+	}
+}
+
+func (bc *BlockChain) CommitBlockPreWithListenTime(block *types.Block, listenTime time.Time) {
+	if bc.MSRACache != nil {
+		blockPre := cache.NewBlockPreWithListenTime(block, listenTime)
+		bc.MSRACache.CommitBlockPre(blockPre)
+	}
 }
 
 func (bc *BlockChain) getProcInterrupt() bool {
@@ -321,6 +416,12 @@ func (bc *BlockChain) empty() bool {
 	return true
 }
 
+// GetTransactionByHash tries to return an already finalized transaction
+func (bc *BlockChain) GetTransactionByHash(hash common.Hash) (*types.Transaction, common.Hash, uint64, uint64) {
+	// tx, blockHash, blockNumber, index
+	return rawdb.ReadTransaction(bc.db, hash)
+}
+
 // loadLastState loads the last known chain state from the database. This method
 // assumes that the chain manager mutex is held.
 func (bc *BlockChain) loadLastState() error {
@@ -341,7 +442,7 @@ func (bc *BlockChain) loadLastState() error {
 	// Make sure the state associated with the block is available
 	if _, err := state.New(currentBlock.Root(), bc.stateCache); err != nil {
 		// Dangling block without a state associated, init from scratch
-		log.Warn("Head state missing, repairing chain", "number", currentBlock.Number(), "hash", currentBlock.Hash())
+		log.Warn("Head state missing, repairing chain", "number", currentBlock.Number(), "hash", currentBlock.Hash(), "err", err.Error())
 		if err := bc.repair(&currentBlock); err != nil {
 			return err
 		}
@@ -567,6 +668,11 @@ func (bc *BlockChain) repair(head **types.Block) error {
 		// Abort if we've rewound to a head block that does have associated state
 		if _, err := state.New((*head).Root(), bc.stateCache); err == nil {
 			log.Info("Rewound blockchain to past state", "number", (*head).Number(), "hash", (*head).Hash())
+
+			if rawdb.GlobalEmulateHook.IsEmulateMode() {
+				log.Crit("Emulate mode start failed, state not found")
+			}
+
 			return nil
 		}
 		// Otherwise rewind one block and recheck state availability there
@@ -819,6 +925,7 @@ func (bc *BlockChain) Stop() {
 	atomic.StoreInt32(&bc.procInterrupt, 1)
 
 	bc.wg.Wait()
+	bc.asyncWriteWg.Wait()
 
 	// Ensure the state of a recent block is also stored to disk before exiting.
 	// We're writing three different states to catch different restart scenarios:
@@ -859,6 +966,14 @@ func (bc *BlockChain) procFutureBlocks() {
 		sort.Slice(blocks, func(i, j int) bool {
 			return blocks[i].NumberU64() < blocks[j].NumberU64()
 		})
+
+		if bc.chainConfig.MSRAChainSettings.DataLoggerInsertchain {
+			for i := range blocks {
+				bc.InsertChainWithInvoker(blocks[i:i+1], "procFutureBlocks")
+			}
+			return
+		}
+
 		// Insert one by one as chain insertion needs contiguous ancestry between blocks
 		for i := range blocks {
 			bc.InsertChain(blocks[i : i+1])
@@ -878,6 +993,11 @@ const (
 // Rollback is designed to remove a chain of links from the database that aren't
 // certain enough to be valid.
 func (bc *BlockChain) Rollback(chain []common.Hash) {
+	if rawdb.GlobalEmulateHook.IsEmulateMode() { // prevent db corruption in emulate mode
+		log.Error("Rollback is not supposed to be called in emulate mode")
+		return
+	}
+
 	bc.chainmu.Lock()
 	defer bc.chainmu.Unlock()
 
@@ -952,6 +1072,10 @@ type numberHash struct {
 // InsertReceiptChain attempts to complete an already existing header chain with
 // transaction and receipt data.
 func (bc *BlockChain) InsertReceiptChain(blockChain types.Blocks, receiptChain []types.Receipts, ancientLimit uint64) (int, error) {
+	if rawdb.GlobalEmulateHook.IsEmulateMode() { // MSRA!!! guard against dangerous methods in emulate mode
+		panic("InsertReceiptChain is not supposed to be called in emulate mode")
+	}
+
 	// We don't require the chainMu here since we want to maximize the
 	// concurrency of header insertion and receipt insertion.
 	bc.wg.Add(1)
@@ -1273,6 +1397,25 @@ func (bc *BlockChain) writeBlockWithState(block *types.Block, receipts []*types.
 	bc.wg.Add(1)
 	defer bc.wg.Done()
 
+	var delayedWrites []func()
+	// disable pipelined write as there are unresolved concurrency issue
+	pipelinedWrite := false // state.BloomProcessor != nil && !bc.cacheConfig.TrieDirtyDisabled // Todo: use a dedicated control
+	if pipelinedWrite {
+		bc.asyncWriteWg.Wait()
+		defer func() {
+			if delayedWrites == nil || err != nil {
+				return
+			}
+			bc.asyncWriteWg.Add(1)
+			go func() {
+				for _, f := range delayedWrites {
+					f()
+				}
+				bc.asyncWriteWg.Done()
+			}()
+		}()
+	}
+
 	// Calculate the total difficulty of the block
 	ptd := bc.GetTd(block.ParentHash(), block.NumberU64()-1)
 	if ptd == nil {
@@ -1287,70 +1430,117 @@ func (bc *BlockChain) writeBlockWithState(block *types.Block, receipts []*types.
 	if err := bc.hc.WriteTd(block.Hash(), block.NumberU64(), externTd); err != nil {
 		return NonStatTy, err
 	}
-	rawdb.WriteBlock(bc.db, block)
+
+	if pipelinedWrite {
+		var writeBlockWg sync.WaitGroup
+		writeBlockWg.Add(1)
+		go func() {
+			rawdb.WriteBlock(bc.db, block)
+			writeBlockWg.Done()
+		}()
+		defer writeBlockWg.Wait()
+	} else {
+		rawdb.WriteBlock(bc.db, block)
+	}
 
 	root, err := state.Commit(bc.chainConfig.IsEIP158(block.Number()))
 	if err != nil {
 		return NonStatTy, err
 	}
+
 	triedb := bc.stateCache.TrieDB()
 
 	// If we're running an archive node, always flush
 	if bc.cacheConfig.TrieDirtyDisabled {
+		if pipelinedWrite {
+			panic("Do not support pipelinedWrite in archive node")
+		}
 		if err := triedb.Commit(root, false); err != nil {
 			return NonStatTy, err
 		}
 	} else {
-		// Full but not archive node, do proper garbage collection
-		triedb.Reference(root, common.Hash{}) // metadata reference to keep trie alive
-		bc.triegc.Push(root, -int64(block.NumberU64()))
+		doTrieGC := func() {
+			// Full but not archive node, do proper garbage collection
+			triedb.Reference(root, common.Hash{}) // metadata reference to keep trie alive
+			bc.triegc.Push(root, -int64(block.NumberU64()))
 
-		if current := block.NumberU64(); current > TriesInMemory {
-			// If we exceeded our memory allowance, flush matured singleton nodes to disk
-			var (
-				nodes, imgs = triedb.Size()
-				limit       = common.StorageSize(bc.cacheConfig.TrieDirtyLimit) * 1024 * 1024
-			)
-			if nodes > limit || imgs > 4*1024*1024 {
-				triedb.Cap(limit - ethdb.IdealBatchSize)
-			}
-			// Find the next state trie we need to commit
-			chosen := current - TriesInMemory
+			if current := block.NumberU64(); current > TriesInMemory {
+				// If we exceeded our memory allowance, flush matured singleton nodes to disk
+				var (
+					nodes, imgs = triedb.Size()
+					limit       = common.StorageSize(bc.cacheConfig.TrieDirtyLimit) * 1024 * 1024
+				)
+				if nodes > limit || imgs > 4*1024*1024 {
+					triedb.Cap(limit - ethdb.IdealBatchSize)
+				}
+				// Find the next state trie we need to commit
+				chosen := current - TriesInMemory
 
-			// If we exceeded out time allowance, flush an entire trie to disk
-			if bc.gcproc > bc.cacheConfig.TrieTimeLimit {
-				// If the header is missing (canonical chain behind), we're reorging a low
-				// diff sidechain. Suspend committing until this operation is completed.
-				header := bc.GetHeaderByNumber(chosen)
-				if header == nil {
-					log.Warn("Reorg in progress, trie commit postponed", "number", chosen)
-				} else {
-					// If we're exceeding limits but haven't reached a large enough memory gap,
-					// warn the user that the system is becoming unstable.
-					if chosen < lastWrite+TriesInMemory && bc.gcproc >= 2*bc.cacheConfig.TrieTimeLimit {
-						log.Info("State in memory for too long, committing", "time", bc.gcproc, "allowance", bc.cacheConfig.TrieTimeLimit, "optimum", float64(chosen-lastWrite)/TriesInMemory)
+				if !rawdb.GlobalEmulateHook.IsEmulateMode() {
+					/* !!! MSRA force commit per 1000 blocks !!! */
+					if chosen%1000 < 10 && chosen > lastWrite+10 {
+						header := bc.GetHeaderByNumber(chosen)
+						if header == nil {
+							log.Warn("Reorg in progress, per 1000 block trie commit postponed", "number", chosen)
+						} else {
+							log.Warn("!Flushing per 1000 block!", "number", chosen)
+
+							// Flush an entire trie and restart the counters
+							triedb.Commit(header.Root, true)
+							lastWrite = chosen
+							bc.gcproc = 0
+						}
 					}
-					// Flush an entire trie and restart the counters
-					triedb.Commit(header.Root, true)
-					lastWrite = chosen
-					bc.gcproc = 0
+					/**/
+				}
+
+				// If we exceeded out time allowance, flush an entire trie to disk
+				if bc.gcproc > bc.cacheConfig.TrieTimeLimit {
+					// If the header is missing (canonical chain behind), we're reorging a low
+					// diff sidechain. Suspend committing until this operation is completed.
+					header := bc.GetHeaderByNumber(chosen)
+					if header == nil {
+						log.Warn("Reorg in progress, trie commit postponed", "number", chosen)
+					} else {
+						// If we're exceeding limits but haven't reached a large enough memory gap,
+						// warn the user that the system is becoming unstable.
+						if chosen < lastWrite+TriesInMemory && bc.gcproc >= 2*bc.cacheConfig.TrieTimeLimit {
+							log.Info("State in memory for too long, committing", "time", bc.gcproc, "allowance", bc.cacheConfig.TrieTimeLimit, "optimum", float64(chosen-lastWrite)/TriesInMemory)
+						}
+						// Flush an entire trie and restart the counters
+						triedb.Commit(header.Root, true)
+						lastWrite = chosen
+						bc.gcproc = 0
+					}
+				}
+				// Garbage collect anything below our required write retention
+				for !bc.triegc.Empty() {
+					root, number := bc.triegc.Pop()
+					if uint64(-number) > chosen {
+						bc.triegc.Push(root, number)
+						break
+					}
+					triedb.Dereference(root.(common.Hash))
 				}
 			}
-			// Garbage collect anything below our required write retention
-			for !bc.triegc.Empty() {
-				root, number := bc.triegc.Pop()
-				if uint64(-number) > chosen {
-					bc.triegc.Push(root, number)
-					break
-				}
-				triedb.Dereference(root.(common.Hash))
-			}
+		}
+		if pipelinedWrite {
+			delayedWrites = append(delayedWrites, doTrieGC)
+		} else {
+			doTrieGC()
 		}
 	}
 
 	// Write other block data using a batch.
 	batch := bc.db.NewBatch()
-	rawdb.WriteReceipts(batch, block.Hash(), block.NumberU64(), receipts)
+	doWriteReceipts := func() {
+		rawdb.WriteReceipts(batch, block.Hash(), block.NumberU64(), receipts)
+	}
+	if pipelinedWrite {
+		delayedWrites = append(delayedWrites, doWriteReceipts)
+	} else {
+		doWriteReceipts()
+	}
 
 	// If the total difficulty is higher than our known, add it to the canonical chain
 	// Second clause in the if statement reduces the vulnerability to selfish mining.
@@ -1378,15 +1568,33 @@ func (bc *BlockChain) writeBlockWithState(block *types.Block, receipts []*types.
 			}
 		}
 		// Write the positional metadata for transaction/receipt lookups and preimages
-		rawdb.WriteTxLookupEntries(batch, block)
-		rawdb.WritePreimages(batch, state.Preimages())
+		doWriteLookupAndPreimage := func() {
+			rawdb.WriteTxLookupEntries(batch, block)
+			rawdb.WritePreimages(batch, state.Preimages())
+		}
+		if pipelinedWrite {
+			delayedWrites = append(delayedWrites, doWriteLookupAndPreimage)
+		} else {
+			doWriteLookupAndPreimage()
+		}
 
 		status = CanonStatTy
 	} else {
 		status = SideStatTy
 	}
-	if err := batch.Write(); err != nil {
-		return NonStatTy, err
+
+	if pipelinedWrite {
+		doBatchWrite := func() {
+			err := batch.Write()
+			if err != nil {
+				log.Warn("Batched write fail with error ", err)
+			}
+		}
+		delayedWrites = append(delayedWrites, doBatchWrite)
+	} else {
+		if err := batch.Write(); err != nil {
+			return NonStatTy, err
+		}
 	}
 
 	// Set new head.
@@ -1433,6 +1641,10 @@ func (bc *BlockChain) addFutureBlock(block *types.Block) error {
 //
 // After insertion is done, all accumulated events will be fired.
 func (bc *BlockChain) InsertChain(chain types.Blocks) (int, error) {
+	if bc.InsertChainRecorder != nil {
+		bc.InsertChainRecorder.RecordInsertChain(time.Now(), chain)
+	}
+
 	// Sanity check that we have something meaningful to import
 	if len(chain) == 0 {
 		return 0, nil
@@ -1461,11 +1673,63 @@ func (bc *BlockChain) InsertChain(chain types.Blocks) (int, error) {
 	// Pre-checks passed, start the full block imports
 	bc.wg.Add(1)
 	bc.chainmu.Lock()
+	insertStart := time.Now()
 	n, err := bc.insertChain(chain, true)
+	insertDuration := time.Since(insertStart)
 	bc.chainmu.Unlock()
 	bc.wg.Done()
 
+	// make it visible in the flame graph
+	for ; insertDuration.Milliseconds() < 200; insertDuration = time.Since(insertStart) {
+	}
+
 	return n, err
+}
+
+func (bc *BlockChain) InsertChainWithInvoker(chain types.Blocks, invoker string) (int, error) {
+	if bc.chainConfig.MSRAChainSettings.DataLoggerInsertchain {
+		// Assume not write to same file, not lock here
+		bc.chainmu.Lock()
+		bc.insertChainLogger(chain, invoker)
+		bc.chainmu.Unlock()
+	}
+	return bc.InsertChain(chain)
+}
+
+func (bc *BlockChain) insertChainLogger(chain types.Blocks, invoker string) {
+	sForderPath := fmt.Sprintf("%s/%s/", bc.chainConfig.MSRAChainSettings.DataLoggerDirInsertchain, time.Now().Format("20060102"))
+	sFilePath := fmt.Sprintf("%sinsertchain_%s.json", sForderPath, time.Now().Format("20060102T15"))
+	_, err := os.Stat(sForderPath)
+	if err != nil {
+		os.MkdirAll(sForderPath, os.ModePerm)
+	}
+
+	tmpMap := make(map[string]interface{})
+	tmpMap["timestampNano"] = time.Now().UnixNano()
+	tmpMap["timestampReadable"] = time.Now().Format("2006-01-02T15:04:05Z07:00")
+	tmpMap["headerState"] = map[string]interface{}{
+		"currentHash":   bc.CurrentBlock().Hash().Hex(),
+		"currentHeight": bc.CurrentBlock().Number(),
+		"currentTD":     bc.GetTdByHash(bc.CurrentBlock().Hash()).String(),
+		"parentHash":    bc.CurrentBlock().ParentHash().Hex(),
+	}
+	tmpMap["invoker"] = invoker
+	tmpMap["nodeName"] = bc.chainConfig.MSRAChainSettings.NodeName
+	tmpMap["blocks"] = chain
+	tmpJson, err := json.Marshal(tmpMap)
+	if err != nil {
+		log.Error("Error while marshal insertchain invoking")
+	}
+	tmpJson = append(tmpJson, []byte("\n")...)
+	f, err := os.OpenFile(sFilePath, os.O_WRONLY|os.O_CREATE|os.O_APPEND, 0666)
+	if err != nil {
+		log.Error("Error open insertchain log file", "err", err)
+	}
+	_, err = f.Write(tmpJson)
+	f.Close()
+	if err != nil {
+		log.Error("Error while write insertchain log file", "err", err)
+	}
 }
 
 // insertChain is the internal implementation of InsertChain, which assumes that
@@ -1491,7 +1755,11 @@ func (bc *BlockChain) insertChain(chain types.Blocks, verifySeals bool) (int, er
 	// Fire a single chain head event if we've progressed the chain
 	defer func() {
 		if lastCanon != nil && bc.CurrentBlock().Hash() == lastCanon.Hash() {
+			st := time.Now()
 			bc.chainHeadFeed.Send(ChainHeadEvent{lastCanon})
+			if time.Since(st) > 200*time.Millisecond {
+				log.Warn("SEND CHAINHEADEVENT TOO SLOW", "bn", lastCanon.NumberU64())
+			}
 		}
 	}()
 	// Start the parallel header verifier
@@ -1622,7 +1890,34 @@ func (bc *BlockChain) insertChain(chain types.Blocks, verifySeals bool) (int, er
 		if parent == nil {
 			parent = bc.GetHeader(block.ParentHash(), block.NumberU64()-1)
 		}
-		statedb, err := state.New(parent.Root, bc.stateCache)
+		var statedb *state.StateDB
+		if bc.vmConfig.MSRAVMSettings.CmpReuse {
+			statedb = bc.Warmuper.GetStateDB(parent.Root)
+		}
+		if statedb == nil {
+			statedb, err = state.New(parent.Root, bc.stateCache)
+			statedb.CalWarmupMiss = true
+			statedb.AddrCreateWarmupMiss = make(map[common.Address]struct{})
+		} else {
+			if cache.ToScreen {
+				statedb.CalWarmupMiss = true
+				statedb.AddrCreateWarmupMiss = make(map[common.Address]struct{})
+				if pair := statedb.GetPair(); pair != nil {
+					pair.CalWarmupMiss = true
+					pair.AddrCreateWarmupMiss = make(map[common.Address]struct{})
+				}
+			}
+
+			if bc.vmConfig.MSRAVMSettings.WarmupMissDetail {
+				statedb.ProcessedForDb, statedb.ProcessedForObj = bc.Warmuper.GetProcessed(parent.Root)
+				statedb.WarmupMissDetail = true
+				statedb.AccessedAccountAndKeys = make(map[common.Address]map[common.Hash]struct{})
+				if pair := statedb.GetPair(); pair != nil {
+					pair.ProcessedForDb, pair.ProcessedForObj = bc.Warmuper.GetProcessed(parent.Root)
+					pair.WarmupMissDetail = true
+				}
+			}
+		}
 		if err != nil {
 			return it.index, err
 		}
@@ -1644,12 +1939,60 @@ func (bc *BlockChain) insertChain(chain types.Blocks, verifySeals bool) (int, er
 			}
 		}
 		// Process block using the parent state as reference point
+		cache.ResetLogVar(len(block.Transactions()))
+		bc.MSRACache.Pause()
+		bc.Warmuper.Pause()
+
+		var memStats runtime.MemStats
+		var beforeTotalPausedNs, afterTotalPausedNs uint64
+		var beforeTotalGCNum, afterTotalGCNum uint32
+		if bc.vmConfig.MSRAVMSettings.MemStatus {
+			runtime.ReadMemStats(&memStats)
+			beforeTotalPausedNs = memStats.PauseTotalNs
+			beforeTotalGCNum = memStats.NumGC
+		}
 		substart := time.Now()
+		if bc.vmConfig.MSRAVMSettings.PipelinedBloom {
+			bp := types.NewParallelBloomProcessor()
+			defer bp.Stop()
+			statedb.SetBloomProcessor(bp)
+		}
+
+		// Try to increase the heap size temporarily to stop a new gc from happening with process
+		// and to reduce the gc activities if there is an ongoing one.
+		LARGE_GC_PERCENTAGE := 10000
+		prevPercent := debug.SetGCPercent(LARGE_GC_PERCENTAGE)
+		if prevPercent >= LARGE_GC_PERCENTAGE {
+			debug.SetGCPercent(10 * prevPercent)
+		}
+
 		receipts, logs, usedGas, err := bc.processor.Process(block, statedb, bc.vmConfig)
+		cache.Process = time.Since(substart)
+
+		debug.SetGCPercent(prevPercent)
+
+		if bc.vmConfig.MSRAVMSettings.MemStatus {
+			runtime.ReadMemStats(&memStats)
+			afterTotalPausedNs = memStats.PauseTotalNs
+			afterTotalGCNum = memStats.NumGC
+		}
+
 		if err != nil {
 			bc.reportBlock(block, receipts, err)
 			atomic.StoreUint32(&followupInterrupt, 1)
+			bc.MSRACache.Continue()
+			bc.Warmuper.Continue()
 			return it.index, err
+		}
+
+		if len(statedb.UnknownTxs) > 0 {
+			for i, tx := range statedb.UnknownTxs {
+				receipt := statedb.UnknownTxReceipts[i]
+				if receipt.GasUsed > 21000 {
+					log.Info("Unknown Status Tx", "hash", tx.Hash().Hex(), "gasused", receipt.GasUsed, "status", receipt.Status)
+					break
+				}
+			}
 		}
 		// Update the metrics touched during block processing
 		accountReadTimer.Update(statedb.AccountReads)     // Account reads are complete, we can mark them
@@ -1668,9 +2011,94 @@ func (bc *BlockChain) insertChain(chain types.Blocks, verifySeals bool) (int, er
 		if err := bc.validator.ValidateState(block, statedb, receipts, usedGas); err != nil {
 			bc.reportBlock(block, receipts, err)
 			atomic.StoreUint32(&followupInterrupt, 1)
+			bc.MSRACache.Continue()
+			bc.Warmuper.Continue()
 			return it.index, err
 		}
-		proctime := time.Since(start)
+		verifyTime := time.Since(start)
+
+		if bc.vmConfig.MSRAVMSettings.PerfLogging {
+			processInMicroSeconds := cache.Process.Microseconds()
+			verifyInMicroSeconds := verifyTime.Microseconds()
+			txPerfs := statedb.TxPerfs
+
+			go func(block *types.Block) {
+				timeStr := time.Now().Format("01-02|15:04:05.000")
+				blockResult := fmt.Sprintf("t '[%s]' block '%v_%v'  process %v process+verify %v gas %v\n",
+					timeStr, block.Number().String(), block.Hash().Hex(),
+					processInMicroSeconds, processInMicroSeconds+verifyInMicroSeconds, block.GasUsed())
+				bc.blockLogFile.WriteString(blockResult)
+
+				for _, tf := range txPerfs {
+					toStr := "nil"
+					txTo := tf.Tx.To()
+					if txTo != nil {
+						toStr = txTo.String()
+					}
+
+					warmupMissStr := fmt.Sprintf("wmA %v wmK %v wmCA %v wmCK %v", tf.AddrWarmupMiss, tf.KeyWarmupMiss, tf.AddrCreateWarmupMiss,
+						tf.KeyCreateWarmupMiss)
+
+					if bc.vmConfig.MSRAVMSettings.CmpReuse {
+						reuseStatus := tf.ReuseStatus
+						reuseStr := fmt.Sprintf("baseStatus '%v'", reuseStatus.BaseStatus.String())
+						if tf.Delay < 0 && reuseStatus.BaseStatus == cmptypes.NoPreplay {
+							reuseStr = "baseStatus 'NoListen'"
+						}
+						if reuseStatus.BaseStatus == cmptypes.Hit {
+							reuseStr += fmt.Sprintf(" hitType '%v'", reuseStatus.HitType.String())
+							if reuseStatus.HitType == cmptypes.MixHit {
+								//if reuseStatus.MixStatus != nil && reuseStatus.MixStatus.MixHitType != cmptypes.NotMixHit {
+								reuseStr += fmt.Sprintf(" mixHitType '%v'", reuseStatus.MixStatus.MixHitType.String())
+							} else if reuseStatus.HitType == cmptypes.TraceHit {
+								reuseStr += fmt.Sprintf(" traceHitType '%v'", reuseStatus.TraceStatus.TraceHitType.String())
+							}
+						}
+
+						if reuseStatus.BaseStatus == cmptypes.Miss {
+							reuseStr += fmt.Sprintf(" missType '%v' RnC %v", reuseStatus.MissType.String(), reuseStatus.RoundCount)
+						}
+
+						if reuseStatus.MixStatus != nil {
+							reuseStr += " " + reuseStatus.MixStatus.GetPerfString()
+						}
+
+						if reuseStatus.TraceStatus != nil {
+							reuseStr += " " + reuseStatus.TraceStatus.GetPerfString()
+						}
+
+						txResult := fmt.Sprintf("t '[%s]' id '%v' tx '%v' to '%v' reuse %v gas %v gasprice %v delay %v %v %v\n",
+							timeStr, block.Number().String()+"_"+block.Hash().Hex()+"_"+strconv.Itoa(int(tf.Receipt.TransactionIndex)),
+							tf.Receipt.TxHash.Hex(),
+							toStr,
+							tf.Time.Nanoseconds(), tf.Receipt.GasUsed, tf.Tx.GasPrice().String(), tf.Delay, reuseStr, warmupMissStr)
+						bc.txLogFile.WriteString(txResult)
+					} else {
+						if bc.vmConfig.MSRAVMSettings.EnablePreplay {
+							reuseStr := "baseStatus 'IgnorePreplay'"
+							if tf.Delay < 0 {
+								reuseStr = "baseStatus 'NoListen'"
+							}
+							txResult := fmt.Sprintf("t '[%s]' id '%v' tx '%v' to '%v' base %v gas %v gasprice %v delay %v %v %v\n",
+								timeStr, block.Number().String()+"_"+block.Hash().Hex()+"_"+strconv.Itoa(int(tf.Receipt.TransactionIndex)),
+								tf.Receipt.TxHash.Hex(),
+								toStr,
+								tf.Time.Nanoseconds(), tf.Receipt.GasUsed, tf.Tx.GasPrice().String(), tf.Delay, reuseStr, warmupMissStr)
+							bc.txLogFile.WriteString(txResult)
+						} else {
+							txResult := fmt.Sprintf("t '[%s]' id '%v' tx '%v' to '%v' base %v gas %v gasprice %v %v\n",
+								timeStr, block.Number().String()+"_"+block.Hash().Hex()+"_"+strconv.Itoa(int(tf.Receipt.TransactionIndex)),
+								tf.Receipt.TxHash.Hex(),
+								toStr,
+								tf.Time.Nanoseconds(), tf.Receipt.GasUsed,
+								tf.Tx.GasPrice().String(), warmupMissStr)
+							bc.txLogFile.WriteString(txResult)
+						}
+					}
+				}
+
+			}(block)
+		}
 
 		// Update the metrics touched during block validation
 		accountHashTimer.Update(statedb.AccountHashes) // Account hashes are complete, we can mark them
@@ -1683,9 +2111,26 @@ func (bc *BlockChain) insertChain(chain types.Blocks, verifySeals bool) (int, er
 		status, err := bc.writeBlockWithState(block, receipts, logs, statedb, false)
 		if err != nil {
 			atomic.StoreUint32(&followupInterrupt, 1)
+			bc.MSRACache.Continue()
+			bc.Warmuper.Continue()
 			return it.index, err
 		}
 		atomic.StoreUint32(&followupInterrupt, 1)
+
+		var signer = types.NewEIP155Signer(bc.chainConfig.ChainID)
+		var noEnpoolSender map[common.Address]struct{}
+		if !bc.vmConfig.MSRAVMSettings.Silent {
+			noEnpoolSender = bc.MSRACache.InfoPrint(block, signer, bc.vmConfig, bc.MSRACache.Synced(), bc.ReportReuseMiss, statedb)
+		}
+		bc.MSRACache.Continue()
+		bc.Warmuper.Continue()
+		for _, txn := range block.Transactions() {
+			sender, _ := types.Sender(signer, txn)
+			bc.MSRACache.UpdateInWhiteList(sender)
+		}
+		for sender := range noEnpoolSender {
+			bc.MSRACache.AddInWhiteList(sender)
+		}
 
 		// Update the metrics touched during block commit
 		accountCommitTimer.Update(statedb.AccountCommits) // Account commits are complete, we can mark them
@@ -1704,7 +2149,7 @@ func (bc *BlockChain) insertChain(chain types.Blocks, verifySeals bool) (int, er
 			lastCanon = block
 
 			// Only count canonical blocks for GC processing time
-			bc.gcproc += proctime
+			bc.gcproc += verifyTime
 
 		case SideStatTy:
 			log.Debug("Inserted forked block", "number", block.Number(), "hash", block.Hash(),
@@ -1725,6 +2170,37 @@ func (bc *BlockChain) insertChain(chain types.Blocks, verifySeals bool) (int, er
 
 		dirty, _ := bc.stateCache.TrieDB().Size()
 		stats.report(chain, it.index, dirty)
+
+		bc.execTimeList.addExecTime(cache.Process)
+		bc.execTimeList.print(block.NumberU64())
+		if metrics.Enabled {
+			log.Info("Read from trie cost",
+				"accountRead", common.PrettyDuration(statedb.AccountReads),
+				"storageRead", common.PrettyDuration(statedb.StorageReads),
+				"count", storageReadTimer.Count(),
+				"accountRead average", common.PrettyDuration(time.Duration(accountReadTimer.Mean())),
+				"storageRead average", common.PrettyDuration(time.Duration(storageReadTimer.Mean())),
+				"accountRead median", common.PrettyDuration(time.Duration(accountReadTimer.Percentile(0.5))),
+				"storageRead median", common.PrettyDuration(time.Duration(storageReadTimer.Percentile(0.5))))
+		}
+
+		if bc.vmConfig.MSRAVMSettings.MemStatus {
+			m := new(runtime.MemStats)
+			runtime.ReadMemStats(m)
+			log.Info("Read memory statistics",
+				"BlockCount", block.NumberU64()-bc.MSRACache.SyncStart+1,
+				"HeapAlloc", common.StorageSize(m.HeapAlloc),
+				"HeapSys", common.StorageSize(m.HeapSys),
+				"HeapIdle", common.StorageSize(m.HeapIdle),
+				"HeapInuse", common.StorageSize(m.HeapInuse),
+				"NextGC", common.StorageSize(m.NextGC),
+				"PauseTotal", common.PrettyDuration(m.PauseTotalNs),
+				"PauseInProcess", common.PrettyDuration(afterTotalPausedNs-beforeTotalPausedNs),
+				"NumGC", m.NumGC,
+				"NumGCInProcess", afterTotalGCNum-beforeTotalGCNum,
+				"GCCPUFraction", fmt.Sprintf("%.3f%%", m.GCCPUFraction*100),
+			)
+		}
 	}
 	// Any blocks remaining here? The only ones we care about are the future ones
 	if block != nil && err == consensus.ErrFutureBlock {
@@ -2067,6 +2543,7 @@ func (bc *BlockChain) addBadBlock(block *types.Block) {
 // reportBlock logs a bad block error.
 func (bc *BlockChain) reportBlock(block *types.Block, receipts types.Receipts, err error) {
 	bc.addBadBlock(block)
+	debug.PrintStack()
 
 	var receiptString string
 	for i, receipt := range receipts {
@@ -2228,4 +2705,8 @@ func (bc *BlockChain) SubscribeLogsEvent(ch chan<- []*types.Log) event.Subscript
 // block processing has started while false means it has stopped.
 func (bc *BlockChain) SubscribeBlockProcessingEvent(ch chan<- bool) event.Subscription {
 	return bc.scope.Track(bc.blockProcFeed.Subscribe(ch))
+}
+
+func (bc *BlockChain) IsEmulateMode() bool {
+	return rawdb.GlobalEmulateHook.IsEmulateMode()
 }

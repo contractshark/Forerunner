@@ -21,12 +21,15 @@ import (
 	"errors"
 	"fmt"
 	"math/big"
+	"os"
 	"runtime"
 	"sync"
 	"sync/atomic"
+	"time"
 
 	"github.com/ethereum/go-ethereum/accounts"
 	"github.com/ethereum/go-ethereum/accounts/abi/bind"
+	"github.com/ethereum/go-ethereum/cmpreuse"
 	"github.com/ethereum/go-ethereum/common"
 	"github.com/ethereum/go-ethereum/common/hexutil"
 	"github.com/ethereum/go-ethereum/consensus"
@@ -37,6 +40,7 @@ import (
 	"github.com/ethereum/go-ethereum/core/rawdb"
 	"github.com/ethereum/go-ethereum/core/types"
 	"github.com/ethereum/go-ethereum/core/vm"
+	"github.com/ethereum/go-ethereum/emulator"
 	"github.com/ethereum/go-ethereum/eth/downloader"
 	"github.com/ethereum/go-ethereum/eth/filters"
 	"github.com/ethereum/go-ethereum/eth/gasprice"
@@ -46,11 +50,15 @@ import (
 	"github.com/ethereum/go-ethereum/log"
 	"github.com/ethereum/go-ethereum/miner"
 	"github.com/ethereum/go-ethereum/node"
+	"github.com/ethereum/go-ethereum/optipreplayer"
+	"github.com/ethereum/go-ethereum/optipreplayer/cache"
 	"github.com/ethereum/go-ethereum/p2p"
 	"github.com/ethereum/go-ethereum/p2p/enr"
 	"github.com/ethereum/go-ethereum/params"
+	"github.com/ethereum/go-ethereum/reuseverify"
 	"github.com/ethereum/go-ethereum/rlp"
 	"github.com/ethereum/go-ethereum/rpc"
+	"github.com/ethereum/go-ethereum/trie"
 )
 
 type LesServer interface {
@@ -87,6 +95,8 @@ type Ethereum struct {
 
 	APIBackend *EthAPIBackend
 
+	frame *optipreplayer.Frame
+
 	miner     *miner.Miner
 	gasPrice  *big.Int
 	etherbase common.Address
@@ -94,7 +104,11 @@ type Ethereum struct {
 	networkID     uint64
 	netRPCService *ethapi.PublicNetAPI
 
-	lock sync.RWMutex // Protects the variadic fields (e.g. gas price and etherbase)
+	lock          sync.RWMutex // Protects the variadic fields (e.g. gas price and etherbase)
+	reuseVerifier *reuseverify.ReuseVerifier
+
+	emulatorWriter emulator.Stoppable
+	recorder       emulator.Stoppable
 }
 
 func (s *Ethereum) AddLesServer(ls LesServer) {
@@ -130,15 +144,21 @@ func New(ctx *node.ServiceContext, config *Config) (*Ethereum, error) {
 	}
 	log.Info("Allocated trie memory caches", "clean", common.StorageSize(config.TrieCleanCache)*1024*1024, "dirty", common.StorageSize(config.TrieDirtyCache)*1024*1024)
 
+	config.MSRAVMSettings.InitEmulateHook() // must be called before setup freezer
+
 	// Assemble the Ethereum object
 	chainDb, err := ctx.OpenDatabaseWithFreezer("chaindata", config.DatabaseCache, config.DatabaseHandles, config.DatabaseFreezer, "eth/db/chaindata/")
 	if err != nil {
 		return nil, err
 	}
+
+	rawdb.GlobalEmulateHook.SetChainDB(chainDb)
+
 	chainConfig, genesisHash, genesisErr := core.SetupGenesisBlockWithOverride(chainDb, config.Genesis, config.OverrideIstanbul, config.OverrideMuirGlacier)
 	if _, ok := genesisErr.(*params.ConfigCompatError); genesisErr != nil && !ok {
 		return nil, genesisErr
 	}
+	ctx.MSRAChainConfig(chainConfig)
 	log.Info("Initialised chain configuration", "config", chainConfig)
 
 	eth := &Ethereum{
@@ -175,6 +195,7 @@ func New(ctx *node.ServiceContext, config *Config) (*Ethereum, error) {
 			EnablePreimageRecording: config.EnablePreimageRecording,
 			EWASMInterpreter:        config.EWASMInterpreter,
 			EVMInterpreter:          config.EVMInterpreter,
+			MSRAVMSettings:          config.MSRAVMSettings,
 		}
 		cacheConfig = &core.CacheConfig{
 			TrieCleanLimit:      config.TrieCleanCache,
@@ -188,6 +209,20 @@ func New(ctx *node.ServiceContext, config *Config) (*Ethereum, error) {
 	if err != nil {
 		return nil, err
 	}
+	var cmpr *cmpreuse.Cmpreuse
+	var msracache *cache.GlobalCache
+
+	msracache = cache.NewGlobalCache(60*6, 60*6000, 6144, config.MSRAVMSettings.LogRoot)
+	msracache.Synced = eth.Synced
+	if vmConfig.MSRAVMSettings.EnablePreplay || vmConfig.MSRAVMSettings.GroundRecord {
+		cmpr = cmpreuse.NewCmpreuse()
+		cmpr.MSRACache = msracache
+		eth.blockchain.Warmuper.SetGlobalCache(msracache)
+	}
+
+	eth.blockchain.Cmpreuse = cmpr
+	eth.blockchain.MSRACache = msracache
+
 	// Rewind the chain in case of an incompatible config upgrade.
 	if compat, ok := genesisErr.(*params.ConfigCompatError); ok {
 		log.Warn("Rewinding chain to upgrade configuration", "err", compat)
@@ -200,6 +235,7 @@ func New(ctx *node.ServiceContext, config *Config) (*Ethereum, error) {
 		config.TxPool.Journal = ctx.ResolvePath(config.TxPool.Journal)
 	}
 	eth.txPool = core.NewTxPool(config.TxPool, chainConfig, eth.blockchain)
+	eth.txPool.MSRACache = msracache
 
 	// Permit the downloader to use the trie cache allowance during fast sync
 	cacheLimit := cacheConfig.TrieCleanLimit + cacheConfig.TrieDirtyLimit
@@ -210,8 +246,23 @@ func New(ctx *node.ServiceContext, config *Config) (*Ethereum, error) {
 	if eth.protocolManager, err = NewProtocolManager(chainConfig, checkpoint, config.SyncMode, config.NetworkId, eth.eventMux, eth.txPool, eth.engine, eth.blockchain, chainDb, cacheLimit, config.Whitelist); err != nil {
 		return nil, err
 	}
+
+	if config.MSRAVMSettings.Selfish {
+		eth.protocolManager.SelfishMode = true
+	}
+
 	eth.miner = miner.New(eth, &config.Miner, chainConfig, eth.EventMux(), eth.engine, eth.isLocalBlock)
 	eth.miner.SetExtra(makeExtraData(config.Miner.ExtraData))
+
+	if config.MSRAVMSettings.EnablePreplay {
+		eth.frame = optipreplayer.NewFrame(eth, eth.blockchain.Config(), eth.EventMux(),
+			eth.engine, config.Miner.GasFloor, config.Miner.GasCeil, &config.MSRAVMSettings)
+		eth.frame.SetExtra(makeExtraData(config.Miner.ExtraData))
+		eth.blockchain.ReportReuseMiss = eth.frame.GetMissReporter()
+	}
+	if config.MSRAVMSettings.ReuseTracerChecking {
+		cmpreuse.DEBUG_TRACER = true
+	}
 
 	eth.APIBackend = &EthAPIBackend{ctx.ExtRPCEnabled(), eth, nil}
 	gpoParams := config.GPO
@@ -219,6 +270,54 @@ func New(ctx *node.ServiceContext, config *Config) (*Ethereum, error) {
 		gpoParams.Default = config.Miner.GasPrice
 	}
 	eth.APIBackend.gpo = gasprice.NewOracle(eth.APIBackend, gpoParams)
+
+	if config.MSRAVMSettings.EnableReuseVerifier {
+		eth.reuseVerifier = reuseverify.NewReuseVerifier(chainConfig, eth.blockchain, eth.engine)
+
+		go func() {
+			eth.reuseVerifier.DoBlocksTest(8000000, 8100000)
+		}()
+
+		go func() {
+			eth.reuseVerifier.DoBlocksTest(8100000, 8200000)
+		}()
+
+		go func() {
+			eth.reuseVerifier.DoBlocksTest(8200000, 8300000)
+		}()
+
+		go func() {
+			eth.reuseVerifier.DoBlocksTest(8300000, 8400000)
+		}()
+	}
+
+	if config.MSRAVMSettings.HasherParallelism > 0 {
+		trie.InitParallelHasher(config.MSRAVMSettings.HasherParallelism)
+	}
+
+	if config.MSRAVMSettings.EnableEmulatorLogger {
+		logDir := fmt.Sprintf("%s/%s",
+			config.MSRAVMSettings.EmulatorDir, time.Now().Format("20060102T150405.999999"))
+
+		_, err = os.Stat(logDir)
+		if err != nil {
+			err = os.MkdirAll(logDir, os.ModePerm)
+			if err != nil {
+				panic("Cannot make " + logDir)
+			}
+		}
+
+		writer := emulator.NewFileLogWriter(logDir)
+		recorder := emulator.NewGethRecorder(writer, true, false)
+
+		emulator.GlobalGethRecorder = recorder
+
+		eth.emulatorWriter = writer
+		eth.recorder = recorder
+
+		eth.blockchain.InsertChainRecorder = recorder
+		eth.txPool.TxPoolRecorder = recorder
+	}
 
 	return eth, nil
 }
@@ -425,6 +524,9 @@ func (s *Ethereum) SetEtherbase(etherbase common.Address) {
 	s.lock.Unlock()
 
 	s.miner.SetEtherbase(etherbase)
+	if s.config.MSRAVMSettings.EnablePreplay {
+		s.frame.SetEtherbase(etherbase)
+	}
 }
 
 // StartMining starts the miner with the given number of CPU threads. If mining
@@ -467,8 +569,12 @@ func (s *Ethereum) StartMining(threads int) error {
 		// If mining is started, we can disable the transaction rejection mechanism
 		// introduced to speed sync times.
 		atomic.StoreUint32(&s.protocolManager.acceptTxs, 1)
+		startRecorder()
 
 		go s.miner.Start(eb)
+		if s.config.MSRAVMSettings.EnablePreplay {
+			go s.frame.Start(eb)
+		}
 	}
 	return nil
 }
@@ -485,6 +591,9 @@ func (s *Ethereum) StopMining() {
 	}
 	// Stop the block creating itself
 	s.miner.Stop()
+	if s.config.MSRAVMSettings.EnablePreplay {
+		s.frame.Stop()
+	}
 }
 
 func (s *Ethereum) IsMining() bool      { return s.miner.Mining() }
@@ -520,13 +629,24 @@ func (s *Ethereum) Protocols() []p2p.Protocol {
 // Start implements node.Service, starting all internal goroutines needed by the
 // Ethereum protocol implementation.
 func (s *Ethereum) Start(srvr *p2p.Server) error {
-	s.startEthEntryUpdate(srvr.LocalNode())
+	if !s.config.MSRAVMSettings.IsEmulateMode {
+		s.startEthEntryUpdate(srvr.LocalNode())
+	}
 
 	// Start the bloom bits servicing goroutines
 	s.startBloomHandlers(params.BloomBitsBlocks)
 
 	// Start the RPC service
 	s.netRPCService = ethapi.NewPublicNetAPI(srvr, s.NetVersion())
+
+	if s.config.MSRAVMSettings.EnablePreplay {
+		s.frame.SetNodeID(srvr.NodeInfo().ID)
+		s.frame.SetGlobalCache(s.BlockChain().MSRACache)
+		s.frame.SetPreplayFlag(srvr.EnablePreplay)
+		s.frame.SetFeatureFlag(srvr.EnableFeature)
+	}
+
+	delayedBlockStatsLevel := srvr.DelayedBlockStatsLevel
 
 	// Figure out a max peers count based on the server limits
 	maxPeers := srvr.MaxPeers
@@ -537,7 +657,7 @@ func (s *Ethereum) Start(srvr *p2p.Server) error {
 		maxPeers -= s.config.LightPeers
 	}
 	// Start the networking layer and the light server if requested
-	s.protocolManager.Start(maxPeers)
+	s.protocolManager.Start(maxPeers, delayedBlockStatsLevel)
 	if s.lesServer != nil {
 		s.lesServer.Start(srvr)
 	}
@@ -547,6 +667,14 @@ func (s *Ethereum) Start(srvr *p2p.Server) error {
 // Stop implements node.Service, terminating all internal goroutines used by the
 // Ethereum protocol.
 func (s *Ethereum) Stop() error {
+	if s.config.MSRAVMSettings.EnableEmulatorLogger {
+		s.recorder.Stop() // Must stop recorder first
+		s.emulatorWriter.Stop()
+	}
+	if s.config.MSRAVMSettings.EnableReuseVerifier {
+		s.reuseVerifier.Close()
+	}
+
 	s.bloomIndexer.Close()
 	s.blockchain.Stop()
 	s.engine.Close()
@@ -556,6 +684,19 @@ func (s *Ethereum) Stop() error {
 	}
 	s.txPool.Stop()
 	s.miner.Stop()
+	if s.config.MSRAVMSettings.EnablePreplay {
+		s.frame.Stop()
+	}
+	s.eventMux.Stop()
+
+	s.chainDb.Close()
+	close(s.shutdownChan)
+	return nil
+}
+
+func (s *Ethereum) MsraCloseCalledFromGethEmulatorGenerator() error {
+	s.blockchain.Stop()
+	s.engine.Close()
 	s.eventMux.Stop()
 
 	s.chainDb.Close()

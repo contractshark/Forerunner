@@ -1,3 +1,6 @@
+// Copyright (c) 2021 Microsoft Corporation. 
+ // Licensed under the GNU General Public License v3.0.
+
 // Copyright 2014 The go-ethereum Authors
 // This file is part of the go-ethereum library.
 //
@@ -23,6 +26,7 @@ import (
 
 	"github.com/ethereum/go-ethereum/common"
 	"github.com/ethereum/go-ethereum/common/math"
+	"github.com/ethereum/go-ethereum/core/rawdb"
 	"github.com/ethereum/go-ethereum/log"
 )
 
@@ -39,6 +43,68 @@ type Config struct {
 	EVMInterpreter   string // External EVM interpreter options
 
 	ExtraEips []int // Additional EIPS that are to be enabled
+
+	MSRAVMSettings MSRAVMConfig
+}
+
+type MSRAVMConfig struct {
+	Silent              bool
+	LogRoot             string
+	MemStatus           bool
+	CmpReuse            bool
+	CmpReuseChecking    bool
+	CmpReuseLogging     bool
+	CmpReuseLoggingDir  string
+	TaskBuilderChecking bool
+	EnablePreplay       bool
+	CacheRecord         bool
+	GroundRecord        bool
+	PreplayRecord       bool
+	NoReusePrint        bool
+	EnableReuseVerifier bool
+	HasherParallelism   int
+	PipelinedBloom      bool
+	ReuseTracerChecking bool
+	Selfish             bool
+	NoTrace             bool
+	NoMemoization       bool
+	NoOverMatching      bool
+	SingleFuture        bool
+	NoWarmuper          bool
+	NoReuse             bool
+	AddFastPath         bool
+	DetailTime          bool
+	FindAllStateFrom	uint64
+
+	// emulator
+	EmulatorDir          string
+	EnableEmulatorLogger bool
+	IsEmulateMode        bool
+	EmulateFromBlock     uint64
+	EmulateFile          string
+
+	EnableReuseTracer  bool
+	TxApplyPerfLogging bool
+	PerfLogging        bool
+	ParallelizeReuse   bool
+	WarmupMissDetail   bool
+	ReportMissDetail   bool
+	GethCacheSizeInMB  int
+}
+
+func (p *MSRAVMConfig) IsPrintRecord() bool {
+	return !p.NoReusePrint
+}
+
+func (p *MSRAVMConfig) InitEmulateHook() {
+	var hook rawdb.EmulateHook
+	if p.IsEmulateMode {
+		hook = rawdb.NewEmulateHook(p.EmulateFromBlock)
+	} else {
+		hook = &rawdb.EmptyEmulateHook{}
+	}
+
+	rawdb.GlobalEmulateHook = hook
 }
 
 // Interpreter is used to run Ethereum based contracts and will utilise the
@@ -154,9 +220,20 @@ func (in *EVMInterpreter) Run(contract *Contract, input []byte, readOnly bool) (
 	// as every returning call will return new data anyway.
 	in.returnData = nil
 
+	rt := in.evm.RTracer
+	needRT := NeedRT(rt)
+	if needRT {
+		rt.ClearReturnData()
+		rt.TraceGuardCodeLen()
+	}
+
 	// Don't bother with the execution if there's no code.
 	if len(contract.Code) == 0 {
 		return nil, nil
+	}
+
+	if needRT {
+		rt.MarkNotExternalTransfer()
 	}
 
 	var (
@@ -175,6 +252,10 @@ func (in *EVMInterpreter) Run(contract *Contract, input []byte, readOnly bool) (
 		res     []byte // result of the opcode execution function
 	)
 	contract.Input = input
+
+	if needRT {
+		stack.RTracer = rt
+	}
 
 	// Reclaim the stack as an int pool when the execution stops
 	defer func() { in.intPool.put(stack.data...) }()
@@ -207,6 +288,15 @@ func (in *EVMInterpreter) Run(contract *Contract, input []byte, readOnly bool) (
 		if !operation.valid {
 			return nil, fmt.Errorf("invalid opcode 0x%x", int(op))
 		}
+
+		if needRT {
+			rsLen := rt.GetStackSize()
+			rmLen := rt.GetMemSize()
+			if rsLen != stack.len() || rmLen != mem.Len() {
+				panic(fmt.Sprintf("[before] Ummatched stack or mem size! stack %v, rstack %v, mem %v, rmem %v", stack.len(), rsLen, mem.Len(), rmLen))
+			}
+		}
+
 		// Validate stack
 		if sLen := stack.len(); sLen < operation.minStack {
 			return nil, fmt.Errorf("stack underflow (%d <=> %d)", sLen, operation.minStack)
@@ -220,6 +310,11 @@ func (in *EVMInterpreter) Run(contract *Contract, input []byte, readOnly bool) (
 			// for a call operation is the value. Transferring value from one
 			// account to the others means the state is modified and should also
 			// return with an error.
+			if needRT {
+				if !operation.writes && op == CALL {
+					rt.TraceAssertStackValueZeroness()
+				}
+			}
 			if operation.writes || (op == CALL && stack.Back(2).Sign() != 0) {
 				return nil, errWriteProtection
 			}
@@ -259,6 +354,9 @@ func (in *EVMInterpreter) Run(contract *Contract, input []byte, readOnly bool) (
 		}
 		if memorySize > 0 {
 			mem.Resize(memorySize)
+			if needRT {
+				rt.ResizeMem(memorySize)
+			}
 		}
 
 		if in.cfg.Debug {
@@ -267,7 +365,26 @@ func (in *EVMInterpreter) Run(contract *Contract, input []byte, readOnly bool) (
 		}
 
 		// execute the operation
+		if needRT {
+			TraceOpByName(rt, opCodeToString[op], pc, contract.Gas)
+		}
 		res, err = operation.execute(&pc, in, contract, mem, stack)
+
+		if needRT {
+			rsLen := rt.GetStackSize()
+			rmLen := rt.GetMemSize()
+			if rsLen != stack.len() || rmLen != mem.Len() {
+				panic(fmt.Sprintf("[after] Ummatched stack or mem size! stack %v, rstack %v, mem %v, rmem %v", stack.len(), rsLen, mem.Len(), rmLen))
+			}
+			if rsLen > 0 {
+				rtop := rt.GetTopStack()
+				top := stack.peek()
+				if rtop.Cmp(top) != 0 {
+					panic(fmt.Sprintf("Top of stack does not match stack %v, rstack %v, stackLen %v", top, rtop, rsLen))
+				}
+			}
+		}
+
 		// verifyPool is a build flag. Pool verification makes sure the integrity
 		// of the integer pool by comparing values to a default value.
 		if verifyPool {
@@ -277,6 +394,18 @@ func (in *EVMInterpreter) Run(contract *Contract, input []byte, readOnly bool) (
 		// set the last return to the result of the operation.
 		if operation.returns {
 			in.returnData = res
+			if needRT {
+				rtRes := rt.GetReturnData()
+				if len(res) != len(rtRes) {
+					panic(fmt.Sprintf("Return data length does not match resLen %v, rtResLen %v", len(res), len(rtRes)))
+				}
+				for i, b := range res {
+					rb := rtRes[i]
+					if rb != b {
+						panic(fmt.Sprintf("Return data content does not match res %v, rtRes %v @ %v", b, rb, i))
+					}
+				}
+			}
 		}
 
 		switch {

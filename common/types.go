@@ -1,3 +1,6 @@
+// Copyright (c) 2021 Microsoft Corporation.
+// Licensed under the GNU General Public License v3.0.
+
 // Copyright 2015 The go-ethereum Authors
 // This file is part of the go-ethereum library.
 //
@@ -174,6 +177,18 @@ func (h UnprefixedHash) MarshalText() ([]byte, error) {
 
 // Address represents the 20 byte address of an Ethereum account.
 type Address [AddressLength]byte
+
+type Addresses []Address
+
+func (a Addresses) Len() int { // 重写 Len() 方法
+	return len(a)
+}
+func (a Addresses) Swap(i, j int) { // 重写 Swap() 方法
+	a[i], a[j] = a[j], a[i]
+}
+func (a Addresses) Less(i, j int) bool { // 重写 Less() 方法， 从大到小排序
+	return a[j].String() < a[i].String()
+}
 
 // BytesToAddress returns Address with value b.
 // If b is larger than len(h), b will be cropped from the left.

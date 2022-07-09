@@ -1,3 +1,6 @@
+// Copyright (c) 2021 Microsoft Corporation. 
+ // Licensed under the GNU General Public License v3.0.
+
 // Copyright 2014 The go-ethereum Authors
 // This file is part of the go-ethereum library.
 //
@@ -46,6 +49,14 @@ const (
 	datadirTrustedNodes    = "trusted-nodes.json" // Path within the datadir to the trusted node list
 	datadirNodeDatabase    = "nodes"              // Path within the datadir to store the node infos
 )
+
+type MSRANodeConfig struct {
+	NodeName                 string
+	PreplayEnabledChainhead  bool
+	PreplayDirChainhead      string
+	DataLoggerInsertchain    bool
+	DataLoggerDirInsertchain string
+}
 
 // Config represents a small collection of configuration values to fine tune the
 // P2P network layer of a protocol stack. These values can be further extended by
@@ -191,6 +202,8 @@ type Config struct {
 	staticNodesWarning     bool
 	trustedNodesWarning    bool
 	oldGethResourceWarning bool
+
+	MSRANodeSettings MSRANodeConfig
 }
 
 // IPCEndpoint resolves an IPC endpoint based on a configured value, taking into
@@ -353,7 +366,7 @@ func (c *Config) instanceDir() string {
 	return filepath.Join(c.DataDir, c.name())
 }
 
-// NodeKey retrieves the currently configured private key of the node, checking
+// NodeType retrieves the currently configured private key of the node, checking
 // first any manually set key, falling back to the one found in the configured
 // data folder. If no key can be found, a new one is generated.
 func (c *Config) NodeKey() *ecdsa.PrivateKey {

@@ -1,0 +1,16 @@
+[
+  {
+    "Name": "TxsBlock1P1",
+    "ExecutorNum": 1,
+    "IsTxsInDetector": false,
+    "IsChainHeadDrive": false,
+    "IsTxsNumDrive": false,
+    "PreplayedTxsNumLimit": 0,
+    "IsTxsRatioDrive": false,
+    "PreplayedTxsRatioLimit": 0,
+    "IsBlockCntDrive": true,
+    "PreplayedBlockNumberLimit": 1,
+    "IsPriceRankDrive": false,
+    "PreplayedPriceRankLimit": 0
+  }
+]

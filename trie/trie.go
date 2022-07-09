@@ -1,3 +1,6 @@
+// Copyright (c) 2021 Microsoft Corporation. 
+ // Licensed under the GNU General Public License v3.0.
+
 // Copyright 2014 The go-ethereum Authors
 // This file is part of the go-ethereum library.
 //
@@ -20,10 +23,10 @@ package trie
 import (
 	"bytes"
 	"fmt"
-
 	"github.com/ethereum/go-ethereum/common"
 	"github.com/ethereum/go-ethereum/crypto"
 	"github.com/ethereum/go-ethereum/log"
+	"sync"
 )
 
 var (
@@ -45,8 +48,9 @@ type LeafCallback func(leaf []byte, parent common.Hash) error
 //
 // Trie is not safe for concurrent use.
 type Trie struct {
-	db   *Database
-	root node
+	db                    *Database
+	root                  node
+	parallelHasherEnabled bool
 }
 
 // newFlag returns the cache flag value for a newly created node.
@@ -177,6 +181,146 @@ func (t *Trie) TryUpdate(key, value []byte) error {
 		t.root = n
 	}
 	return nil
+}
+
+func (t *Trie) TryInsertInBatch(hexKeys, values [][]byte) error {
+	if len(hexKeys) != len(values) {
+		panic("keys and values should be of the same length.")
+	}
+	_, n, err := t.insertInBatch(t.root, nil, hexKeys, values)
+	if err != nil {
+		return err
+	}
+	t.root = n
+	return nil
+}
+
+func (t *Trie) insertInBatch(n node, prefix []byte, keyList [][]byte, valueList [][]byte) (bool, node, error) {
+	currentNode := n
+	currentIndex := 0
+
+	for currentIndex < len(keyList) {
+		theNode := currentNode
+		switch theNode := theNode.(type) {
+		case *shortNode:
+			dirty, nn, err := t.insert(theNode, prefix, keyList[currentIndex], valueNode(valueList[currentIndex]))
+			if err != nil {
+				panic("we should never see in error in shortNode of insertInBatch")
+			}
+			if dirty {
+				currentNode = nn
+			}
+			currentIndex++
+		case nil:
+			dirty, nn, err := t.insert(theNode, prefix, keyList[currentIndex], valueNode(valueList[currentIndex]))
+			if dirty != true || err != nil {
+				panic("we should never see an error in nil of insertInBatch")
+			}
+			currentNode = nn
+			currentIndex++
+		case hashNode:
+			rn, err := t.resolveHash(theNode, prefix)
+			if err != nil {
+				panic("We should always resolve with any error in hashNode of insertInBatch")
+			}
+			currentNode = rn
+		case valueNode:
+			if len(keyList) != 1 {
+				panic("value not unique in batch!")
+			}
+			dirty, nn, err := t.insert(theNode, prefix, keyList[currentIndex], valueNode(valueList[currentIndex]))
+			if err != nil {
+				panic("we should never see in error in valueNode of insertInBatch")
+			}
+			if dirty {
+				currentNode = nn
+			}
+			currentIndex++
+		case *fullNode:
+			groupedKeyList := make([][][]byte, 16)
+			groupedValueList := make([][][]byte, 16)
+			nonEmptyGroupCount := 0
+			// group by prefix
+			for i := currentIndex; i < len(keyList); i++ {
+				gk := keyList[i][0]
+				if groupedKeyList[gk] == nil {
+					nonEmptyGroupCount++
+				}
+				groupedKeyList[gk] = append(groupedKeyList[gk], keyList[i])
+				groupedValueList[gk] = append(groupedValueList[gk], valueList[i])
+			}
+			newChildren := make([]node, 16)
+			var childrenWG sync.WaitGroup
+			var newChildrenMutex sync.Mutex
+			var isAnyNewChildren = false
+			for gk := range groupedKeyList {
+				if groupedKeyList[gk] == nil {
+					continue
+				}
+				k0 := groupedKeyList[gk][0][0]
+				if int(k0) != gk {
+					panic("Wrong grouped key list!")
+				}
+				keyRestList := make([][]byte, len(groupedKeyList[gk]))
+				valueRestList := groupedValueList[gk]
+				for j, kl := range groupedKeyList[gk] {
+					keyRestList[j] = kl[1:]
+				}
+
+				if nonEmptyGroupCount > 1 && tryGetParallelExecutionSlot() {
+					newPrefix := make([]byte, len(prefix), len(prefix)+1)
+					copy(newPrefix, prefix)
+					newPrefix = append(newPrefix, k0)
+					doJob := func() {
+						dirty, nn, err := t.insertInBatch(theNode.Children[k0], newPrefix, keyRestList, valueRestList)
+						if err != nil {
+							panic("never should have error in fullNode of insertInBatch")
+						}
+						if dirty {
+							newChildren[k0] = nn
+							newChildrenMutex.Lock()
+							isAnyNewChildren = true
+							newChildrenMutex.Unlock()
+						}
+					}
+					executeInParallel(doJob, &childrenWG)
+				} else {
+					dirty, nn, err := t.insertInBatch(theNode.Children[k0], append(prefix, k0), keyRestList, valueRestList)
+					if err != nil {
+						panic("never should have error in fullNode of insertInBatch")
+					}
+					if dirty {
+						newChildren[k0] = nn
+						newChildrenMutex.Lock()
+						isAnyNewChildren = true
+						newChildrenMutex.Unlock()
+					}
+				}
+				nonEmptyGroupCount--
+			}
+			childrenWG.Wait()
+			newChildrenMutex.Lock()
+			needCopyNode := isAnyNewChildren
+			newChildrenMutex.Unlock()
+			if needCopyNode {
+				theNewNode := theNode.copy()
+				theNewNode.flags = t.newFlag()
+				for i, c := range newChildren {
+					if c != nil {
+						theNewNode.Children[i] = c
+					}
+				}
+				currentNode = theNewNode
+			} else {
+				currentNode = theNode
+			}
+			currentIndex = len(keyList)
+		default:
+			panic(fmt.Sprintf("%T: invalid node: %v", n, n))
+		}
+	}
+
+	return currentNode != n, currentNode, nil
 }
 
 func (t *Trie) insert(n node, prefix, key []byte, value node) (bool, node, error) {
@@ -428,6 +572,7 @@ func (t *Trie) hashRoot(db *Database, onleaf LeafCallback) (node, node, error) {
 		return hashNode(emptyRoot.Bytes()), nil, nil
 	}
 	h := newHasher(onleaf)
+	h.isParallel = t.parallelHasherEnabled
 	defer returnHasherToPool(h)
 	return h.hash(t.root, db, true)
 }

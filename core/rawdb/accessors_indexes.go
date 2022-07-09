@@ -1,3 +1,6 @@
+// Copyright (c) 2021 Microsoft Corporation. 
+ // Licensed under the GNU General Public License v3.0.
+
 // Copyright 2018 The go-ethereum Authors
 // This file is part of the go-ethereum library.
 //
@@ -30,7 +33,15 @@ import (
 // ReadTxLookupEntry retrieves the positional metadata associated with a transaction
 // hash to allow retrieving the transaction or receipt by hash.
 func ReadTxLookupEntry(db ethdb.Reader, hash common.Hash) *uint64 {
-	data, _ := db.Get(txLookupKey(hash))
+	var data []byte
+
+	if GlobalEmulateHook.IsEmulateMode() {
+		data, _ = db.Get(GlobalEmulateHook.PrefixKey(txLookupKey(hash)))
+	}
+
+	if len(data) == 0 {
+		data, _ = db.Get(txLookupKey(hash))
+	}
 	if len(data) == 0 {
 		return nil
 	}
@@ -57,7 +68,11 @@ func ReadTxLookupEntry(db ethdb.Reader, hash common.Hash) *uint64 {
 func WriteTxLookupEntries(db ethdb.KeyValueWriter, block *types.Block) {
 	number := block.Number().Bytes()
 	for _, tx := range block.Transactions() {
-		if err := db.Put(txLookupKey(tx.Hash()), number); err != nil {
+		key := txLookupKey(tx.Hash())
+		if GlobalEmulateHook.IsEmulateMode() {
+			key = GlobalEmulateHook.PrefixKey(key)
+		}
+		if err := db.Put(key, number); err != nil {
 			log.Crit("Failed to store transaction lookup entry", "err", err)
 		}
 	}
@@ -65,6 +80,17 @@ func WriteTxLookupEntries(db ethdb.KeyValueWriter, block *types.Block) {
 
 // DeleteTxLookupEntry removes all transaction data associated with a hash.
 func DeleteTxLookupEntry(db ethdb.KeyValueWriter, hash common.Hash) {
+	if GlobalEmulateHook.IsEmulateMode() {
+		if db.Delete(GlobalEmulateHook.PrefixKey(txLookupKey(hash))) == nil {
+			return
+		} else {
+			// it's rather expensive to check precisely, so for safety, we deny all.
+			log.Error("Preventing layered rawdb from deleting hash behind: ", hash)
+
+			return
+		}
+	}
+
 	db.Delete(txLookupKey(hash))
 }
 
@@ -119,13 +145,19 @@ func ReadReceipt(db ethdb.Reader, hash common.Hash, config *params.ChainConfig) 
 // ReadBloomBits retrieves the compressed bloom bit vector belonging to the given
 // section and bit index from the.
 func ReadBloomBits(db ethdb.KeyValueReader, bit uint, section uint64, head common.Hash) ([]byte, error) {
-	return db.Get(bloomBitsKey(bit, section, head))
+	if GlobalEmulateHook.IsEmulateMode() {
+		if bytes, err := db.Get(bloomBitsKey(bit, section, head, true)); err == nil {
+			return bytes, err
+		}
+	}
+
+	return db.Get(bloomBitsKey(bit, section, head, false))
 }
 
 // WriteBloomBits stores the compressed bloom bits vector belonging to the given
 // section and bit index.
 func WriteBloomBits(db ethdb.KeyValueWriter, bit uint, section uint64, head common.Hash, bits []byte) {
-	if err := db.Put(bloomBitsKey(bit, section, head), bits); err != nil {
+	if err := db.Put(bloomBitsKey(bit, section, head, GlobalEmulateHook.IsEmulateMode()), bits); err != nil {
 		log.Crit("Failed to store bloom bits", "err", err)
 	}
 }

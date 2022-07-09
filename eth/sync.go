@@ -1,3 +1,6 @@
+// Copyright (c) 2021 Microsoft Corporation. 
+ // Licensed under the GNU General Public License v3.0.
+
 // Copyright 2015 The go-ethereum Authors
 // This file is part of the go-ethereum library.
 //
@@ -202,6 +205,7 @@ func (pm *ProtocolManager) synchronise(peer *peer) {
 		// for non-checkpointed (number = 0) private networks.
 		if head.Time() >= uint64(time.Now().AddDate(0, -1, 0).Unix()) {
 			atomic.StoreUint32(&pm.acceptTxs, 1)
+			startRecorder()
 		}
 	}
 	if head.NumberU64() > 0 {

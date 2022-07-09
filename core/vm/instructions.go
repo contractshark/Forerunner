@@ -1,3 +1,6 @@
+// Copyright (c) 2021 Microsoft Corporation. 
+ // Licensed under the GNU General Public License v3.0.
+
 // Copyright 2015 The go-ethereum Authors
 // This file is part of the go-ethereum library.
 //
@@ -20,6 +23,7 @@ import (
 	"errors"
 	"math/big"
 
+	"github.com/ethereum/go-ethereum/cmpreuse/cmptypes"
 	"github.com/ethereum/go-ethereum/common"
 	"github.com/ethereum/go-ethereum/common/math"
 	"github.com/ethereum/go-ethereum/core/types"
@@ -563,9 +567,12 @@ func opBlockhash(pc *uint64, interpreter *EVMInterpreter, contract *Contract, me
 
 	n := interpreter.intPool.get().Sub(interpreter.evm.BlockNumber, common.Big257)
 	if num.Cmp(n) > 0 && num.Cmp(interpreter.evm.BlockNumber) < 0 {
-		stack.push(interpreter.evm.GetHash(num.Uint64()).Big())
+		hash := interpreter.evm.GetHash(num.Uint64())
+		stack.push(hash.Big())
+		interpreter.evm.StateDB.RWRecorder().UpdateRBlockhash(num.Uint64(), hash)
 	} else {
 		stack.push(interpreter.intPool.getZero())
+		interpreter.evm.StateDB.RWRecorder().UpdateRBlockhash(num.Uint64(), common.Hash{})
 	}
 	interpreter.intPool.put(num, n)
 	return nil, nil
@@ -573,26 +580,31 @@ func opBlockhash(pc *uint64, interpreter *EVMInterpreter, contract *Contract, me
 
 func opCoinbase(pc *uint64, interpreter *EVMInterpreter, contract *Contract, memory *Memory, stack *Stack) ([]byte, error) {
 	stack.push(interpreter.intPool.get().SetBytes(interpreter.evm.Coinbase.Bytes()))
+	interpreter.evm.StateDB.RWRecorder().UpdateRHeader(cmptypes.Coinbase, interpreter.evm.Coinbase)
 	return nil, nil
 }
 
 func opTimestamp(pc *uint64, interpreter *EVMInterpreter, contract *Contract, memory *Memory, stack *Stack) ([]byte, error) {
 	stack.push(math.U256(interpreter.intPool.get().Set(interpreter.evm.Time)))
+	interpreter.evm.StateDB.RWRecorder().UpdateRHeader(cmptypes.Timestamp, interpreter.evm.Time)
 	return nil, nil
 }
 
 func opNumber(pc *uint64, interpreter *EVMInterpreter, contract *Contract, memory *Memory, stack *Stack) ([]byte, error) {
 	stack.push(math.U256(interpreter.intPool.get().Set(interpreter.evm.BlockNumber)))
+	interpreter.evm.StateDB.RWRecorder().UpdateRHeader(cmptypes.Number, interpreter.evm.BlockNumber)
 	return nil, nil
 }
 
 func opDifficulty(pc *uint64, interpreter *EVMInterpreter, contract *Contract, memory *Memory, stack *Stack) ([]byte, error) {
 	stack.push(math.U256(interpreter.intPool.get().Set(interpreter.evm.Difficulty)))
+	interpreter.evm.StateDB.RWRecorder().UpdateRHeader(cmptypes.Difficulty, interpreter.evm.Difficulty)
 	return nil, nil
 }
 
 func opGasLimit(pc *uint64, interpreter *EVMInterpreter, contract *Contract, memory *Memory, stack *Stack) ([]byte, error) {
 	stack.push(math.U256(interpreter.intPool.get().SetUint64(interpreter.evm.GasLimit)))
+	interpreter.evm.StateDB.RWRecorder().UpdateRHeader(cmptypes.GasLimit, interpreter.evm.GasLimit)
 	return nil, nil
 }
 
@@ -698,15 +710,28 @@ func opCreate(pc *uint64, interpreter *EVMInterpreter, contract *Contract, memor
 
 	contract.UseGas(gas)
 	res, addr, returnGas, suberr := interpreter.evm.Create(contract, input, gas, value)
+
+	rt := interpreter.evm.RTracer
+	needRT := NeedRT(rt)
+
 	// Push item on the stack based on the returned error. If the ruleset is
 	// homestead we must check for CodeStoreOutOfGasError (homestead only
 	// rule) and treat as an error, if the ruleset is frontier we must
 	// ignore this error and pretend the operation was successful.
 	if interpreter.evm.chainRules.IsHomestead && suberr == ErrCodeStoreOutOfGas {
+		if needRT {
+			rt.TraceCreateReturn(true, suberr==errExecutionReverted)
+		}
 		stack.push(interpreter.intPool.getZero())
 	} else if suberr != nil && suberr != ErrCodeStoreOutOfGas {
+		if needRT {
+			rt.TraceCreateReturn(true, suberr==errExecutionReverted)
+		}
 		stack.push(interpreter.intPool.getZero())
 	} else {
+		if needRT {
+			rt.TraceCreateReturn(false, suberr==errExecutionReverted)
+		}
 		stack.push(interpreter.intPool.get().SetBytes(addr.Bytes()))
 	}
 	contract.Gas += returnGas
@@ -731,10 +756,20 @@ func opCreate2(pc *uint64, interpreter *EVMInterpreter, contract *Contract, memo
 	gas -= gas / 64
 	contract.UseGas(gas)
 	res, addr, returnGas, suberr := interpreter.evm.Create2(contract, input, gas, endowment, salt)
+
+	rt := interpreter.evm.RTracer
+	needRT := NeedRT(rt)
+
 	// Push item on the stack based on the returned error.
 	if suberr != nil {
+		if needRT {
+			rt.TraceCreateReturn(true, suberr==errExecutionReverted)
+		}
 		stack.push(interpreter.intPool.getZero())
 	} else {
+		if needRT {
+			rt.TraceCreateReturn(false, suberr==errExecutionReverted)
+		}
 		stack.push(interpreter.intPool.get().SetBytes(addr.Bytes()))
 	}
 	contract.Gas += returnGas
@@ -761,6 +796,13 @@ func opCall(pc *uint64, interpreter *EVMInterpreter, contract *Contract, memory 
 		gas += params.CallStipend
 	}
 	ret, returnGas, err := interpreter.evm.Call(contract, toAddr, args, gas, value)
+
+	rt := interpreter.evm.RTracer
+	needRT := NeedRT(rt)
+	if needRT {
+		rt.TraceCallReturn(err != nil, err == errExecutionReverted, len(ret)==0)
+	}
+
 	if err != nil {
 		stack.push(interpreter.intPool.getZero())
 	} else {
@@ -790,6 +832,13 @@ func opCallCode(pc *uint64, interpreter *EVMInterpreter, contract *Contract, mem
 		gas += params.CallStipend
 	}
 	ret, returnGas, err := interpreter.evm.CallCode(contract, toAddr, args, gas, value)
+
+	rt := interpreter.evm.RTracer
+	needRT := NeedRT(rt)
+	if needRT {
+		rt.TraceCallReturn(err != nil, err == errExecutionReverted, len(ret)==0)
+	}
+
 	if err != nil {
 		stack.push(interpreter.intPool.getZero())
 	} else {
@@ -815,6 +864,13 @@ func opDelegateCall(pc *uint64, interpreter *EVMInterpreter, contract *Contract,
 	args := memory.GetPtr(inOffset.Int64(), inSize.Int64())
 
 	ret, returnGas, err := interpreter.evm.DelegateCall(contract, toAddr, args, gas)
+
+	rt := interpreter.evm.RTracer
+	needRT := NeedRT(rt)
+	if needRT {
+		rt.TraceCallReturn(err != nil, err == errExecutionReverted, len(ret)==0)
+	}
+
 	if err != nil {
 		stack.push(interpreter.intPool.getZero())
 	} else {
@@ -840,6 +896,13 @@ func opStaticCall(pc *uint64, interpreter *EVMInterpreter, contract *Contract, m
 	args := memory.GetPtr(inOffset.Int64(), inSize.Int64())
 
 	ret, returnGas, err := interpreter.evm.StaticCall(contract, toAddr, args, gas)
+
+	rt := interpreter.evm.RTracer
+	needRT := NeedRT(rt)
+	if needRT {
+		rt.TraceCallReturn(err != nil, err == errExecutionReverted, len(ret)==0)
+	}
+
 	if err != nil {
 		stack.push(interpreter.intPool.getZero())
 	} else {

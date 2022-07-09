@@ -20,6 +20,8 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"github.com/ethereum/go-ethereum/emulator"
+	"github.com/hashicorp/golang-lru"
 	"math"
 	"math/big"
 	"sync"
@@ -77,6 +79,17 @@ type ProtocolManager struct {
 	blockchain *core.BlockChain
 	maxPeers   int
 
+	delayedBlockStatsLevel int
+	// channel and LRU cache for ratio logging
+	msgHashCache  *lru.Cache
+	msgBlockCache *lru.Cache
+	msgTimerCache *lru.Cache
+	msgMinute     *Count
+	msgHour       *Count
+	msgDay        *Count
+	msgHashCh     chan HashesMsg
+	msgBlockCh    chan BlockMsg
+
 	downloader *downloader.Downloader
 	fetcher    *fetcher.Fetcher
 	peers      *peerSet
@@ -97,6 +110,8 @@ type ProtocolManager struct {
 	// wait group is used for graceful shutdowns during downloading
 	// and processing
 	wg sync.WaitGroup
+
+	SelfishMode bool
 }
 
 // NewProtocolManager returns a new Ethereum sub protocol manager. The Ethereum sub protocol manages peers capable
@@ -184,12 +199,21 @@ func NewProtocolManager(config *params.ChainConfig, checkpoint *params.TrustedCh
 		n, err := manager.blockchain.InsertChain(blocks)
 		if err == nil {
 			atomic.StoreUint32(&manager.acceptTxs, 1) // Mark initial sync done on any fetcher import
+
+			startRecorder()
 		}
 		return n, err
 	}
 	manager.fetcher = fetcher.New(blockchain.GetBlockByHash, validator, manager.BroadcastBlock, heighter, inserter, manager.removePeer)
 
 	return manager, nil
+}
+
+func startRecorder() {
+	recorder := emulator.GlobalGethRecorder
+	if recorder != nil {
+		recorder.Start()
+	}
 }
 
 func (pm *ProtocolManager) makeProtocol(version uint) p2p.Protocol {
@@ -244,8 +268,9 @@ func (pm *ProtocolManager) removePeer(id string) {
 	}
 }
 
-func (pm *ProtocolManager) Start(maxPeers int) {
+func (pm *ProtocolManager) Start(maxPeers int, delayedBlockStatsLevel int) {
 	pm.maxPeers = maxPeers
+	pm.delayedBlockStatsLevel = delayedBlockStatsLevel
 
 	// broadcast transactions
 	pm.txsCh = make(chan core.NewTxsEvent, txChanSize)
@@ -259,6 +284,12 @@ func (pm *ProtocolManager) Start(maxPeers int) {
 	// start sync handlers
 	go pm.syncer()
 	go pm.txsyncLoop()
+
+	// start ratio loggers
+	if pm.delayedBlockStatsLevel > 0 {
+		log.Info("ProtocolManager delayed block collection is started")
+		go pm.collectDelayedBlocks()
+	}
 }
 
 func (pm *ProtocolManager) Stop() {
@@ -284,6 +315,252 @@ func (pm *ProtocolManager) Stop() {
 	pm.wg.Wait()
 
 	log.Info("Ethereum protocol stopped")
+}
+
+func (pm *ProtocolManager) collectDelayedBlocks() {
+	if pm.delayedBlockStatsLevel == 0 {
+		log.Info("ProtocolManager delayed block collection is disabled by user")
+		return
+	}
+	log.Info("ProtocolManager delayed block collection start")
+	pm.msgHashCache, _ = lru.New(300000)
+	pm.msgBlockCache, _ = lru.New(300000)
+	pm.msgTimerCache, _ = lru.New(300000)
+
+	pm.msgHashCh = make(chan HashesMsg, 30000)
+	pm.msgBlockCh = make(chan BlockMsg, 30000)
+	go pm.processBlockMsgs()
+
+	pm.msgMinute = &Count{
+		firstReceivedHash:  int64(0),
+		firstReceivedBlock: int64(0),
+		onlyReceivedHash:   int64(0),
+		onlyReceivedBlock:  int64(0),
+	}
+	pm.msgHour = &Count{
+		firstReceivedHash:  int64(0),
+		firstReceivedBlock: int64(0),
+		onlyReceivedHash:   int64(0),
+		onlyReceivedBlock:  int64(0),
+	}
+	pm.msgDay = &Count{
+		firstReceivedHash:  int64(0),
+		firstReceivedBlock: int64(0),
+		onlyReceivedHash:   int64(0),
+		onlyReceivedBlock:  int64(0),
+	}
+	go pm.logPerMinute()
+	go pm.logPerHour()
+	go pm.logPerDay()
+}
+
+func (pm *ProtocolManager) logPerMinute() {
+	for {
+		time.Sleep(10 * time.Minute)
+		if pm.msgMinute.Total() == int64(0) {
+			continue
+		}
+		log.Info("Delayed blocks in 10 minutes",
+			"first received block", pm.msgMinute.firstReceivedBlock,
+			"first received block ratio", float64(pm.msgMinute.firstReceivedBlock)/float64(pm.msgMinute.Total()),
+			"first received hash", pm.msgMinute.firstReceivedHash,
+			"first received hash ratio", float64(pm.msgMinute.firstReceivedHash)/float64(pm.msgMinute.Total()),
+			"only received block", pm.msgMinute.onlyReceivedBlock,
+			"only received block ratio", float64(pm.msgMinute.onlyReceivedBlock)/float64(pm.msgMinute.Total()),
+			"only received hash", pm.msgMinute.onlyReceivedHash,
+			"only received hash ratio", float64(pm.msgMinute.onlyReceivedHash)/float64(pm.msgMinute.Total()),
+			"total", pm.msgMinute.Total())
+		pm.msgMinute.Clear()
+	}
+}
+
+func (pm *ProtocolManager) logPerHour() {
+	for {
+		time.Sleep(1 * time.Hour)
+		if pm.msgHour.Total() == int64(0) {
+			continue
+		}
+		log.Info("Delayed blocks in 1 hour",
+			"first received block", pm.msgHour.firstReceivedBlock,
+			"first received block ratio", float64(pm.msgHour.firstReceivedBlock)/float64(pm.msgHour.Total()),
+			"first received hash", pm.msgHour.firstReceivedHash,
+			"first received hash ratio", float64(pm.msgHour.firstReceivedHash)/float64(pm.msgHour.Total()),
+			"only received block", pm.msgHour.onlyReceivedBlock,
+			"only received block ratio", float64(pm.msgHour.onlyReceivedBlock)/float64(pm.msgHour.Total()),
+			"only received hash", pm.msgHour.onlyReceivedHash,
+			"only received hash ratio", float64(pm.msgHour.onlyReceivedHash)/float64(pm.msgHour.Total()),
+			"total", pm.msgHour.Total())
+		pm.msgHour.Clear()
+	}
+}
+
+func (pm *ProtocolManager) logPerDay() {
+	for {
+		time.Sleep(24 * time.Hour)
+		if pm.msgDay.Total() == int64(0) {
+			continue
+		}
+		log.Info("Delayed blocks in 1 day",
+			"first received block", pm.msgDay.firstReceivedBlock,
+			"first received block ratio", float64(pm.msgDay.firstReceivedBlock)/float64(pm.msgDay.Total()),
+			"first received hash", pm.msgDay.firstReceivedHash,
+			"first received hash ratio", float64(pm.msgDay.firstReceivedHash)/float64(pm.msgDay.Total()),
+			"only received block", pm.msgDay.onlyReceivedBlock,
+			"only received block ratio", float64(pm.msgDay.onlyReceivedBlock)/float64(pm.msgDay.Total()),
+			"only received hash", pm.msgDay.onlyReceivedHash,
+			"only received hash ratio", float64(pm.msgDay.onlyReceivedHash)/float64(pm.msgDay.Total()),
+			"total", pm.msgDay.Total())
+		pm.msgDay.Clear()
+	}
+}
+
+func (pm *ProtocolManager) timer(hash string) {
+	time.Sleep(10 * time.Minute)
+
+	vHash, okHash := pm.msgHashCache.Get(hash)
+	hashMsg, okHash2 := vHash.(HashMsg)
+	if !okHash2 {
+		okHash = false
+	}
+
+	vBlock, okBlock := pm.msgBlockCache.Get(hash)
+	blockMsg, okBlock2 := vBlock.(BlockMsg)
+	if !okBlock2 {
+		okBlock = false
+	}
+	var (
+		trueHead common.Hash
+		trueTD   *big.Int
+	)
+	if okBlock {
+		trueHead = blockMsg.Request.Block.ParentHash()
+		trueTD = new(big.Int).Sub(blockMsg.Request.TD, blockMsg.Request.Block.Difficulty())
+	}
+
+	if !okHash && !okBlock {
+		return
+	} else if okHash && okBlock {
+		hashReceivedAt := hashMsg.ReceivedAt
+		BlockReceivedAt := blockMsg.ReceivedAt
+		if BlockReceivedAt.Before(hashReceivedAt) {
+			pm.msgMinute.firstReceivedBlock++
+			pm.msgHour.firstReceivedBlock++
+			pm.msgDay.firstReceivedBlock++
+			if pm.delayedBlockStatsLevel > 1 {
+				log.Info("ProtocolManager first received block in timer",
+					"block receivedAt", blockMsg.ReceivedAt.String(),
+					"block peer", blockMsg.Peer.id,
+					"block hash", blockMsg.Request.Block.Hash().String(),
+					"block number", blockMsg.Request.Block.Number().String(),
+					"block TD", blockMsg.Request.TD.String(),
+					"hash receivedAt", hashMsg.ReceivedAt.String(),
+					"hash peer", hashMsg.Peer.id,
+					"hash hash", hashMsg.Announce.Hash.String(),
+					"hash number", hashMsg.Announce.Number,
+					"trueHead", trueHead.String(),
+					"trueTD", trueTD.String(),
+					"block before", hashReceivedAt.Sub(BlockReceivedAt).String())
+			}
+		} else {
+			pm.msgMinute.firstReceivedHash++
+			pm.msgHour.firstReceivedHash++
+			pm.msgDay.firstReceivedHash++
+			if pm.delayedBlockStatsLevel > 1 {
+				log.Info("ProtocolManager first received hash in timer",
+					"block receivedAt", blockMsg.ReceivedAt.String(),
+					"block peer", blockMsg.Peer.id,
+					"block hash", blockMsg.Request.Block.Hash().String(),
+					"block number", blockMsg.Request.Block.Number().String(),
+					"block TD", blockMsg.Request.TD.String(),
+					"hash receivedAt", hashMsg.ReceivedAt.String(),
+					"hash peer", hashMsg.Peer.id,
+					"hash hash", hashMsg.Announce.Hash.String(),
+					"hash number", hashMsg.Announce.Number,
+					"trueHead", trueHead.String(),
+					"trueTD", trueTD.String(),
+					"hash before", BlockReceivedAt.Sub(hashReceivedAt).String())
+			}
+		}
+	} else if okHash {
+		pm.msgMinute.onlyReceivedHash++
+		pm.msgHour.onlyReceivedHash++
+		pm.msgDay.onlyReceivedHash++
+		if pm.delayedBlockStatsLevel > 1 {
+			log.Info("ProtocolManager only received hash in timer",
+				"hash receivedAt", hashMsg.ReceivedAt.String(),
+				"hash peer", hashMsg.Peer.id,
+				"hash hash", hashMsg.Announce.Hash.String(),
+				"hash number", hashMsg.Announce.Number)
+		}
+	} else {
+		pm.msgMinute.onlyReceivedBlock++
+		pm.msgHour.onlyReceivedBlock++
+		pm.msgDay.onlyReceivedBlock++
+		if pm.delayedBlockStatsLevel > 1 {
+			log.Info("ProtocolManager only received block in timer",
+				"block receivedAt", blockMsg.ReceivedAt.String(),
+				"block peer", blockMsg.Peer.id,
+				"block hash", blockMsg.Request.Block.Hash().String(),
+				"block number", blockMsg.Request.Block.Number().String(),
+				"block TD", blockMsg.Request.TD.String(),
+				"trueHead", trueHead.String(),
+				"trueTD", trueTD.String())
+		}
+	}
+}
+
+func (pm *ProtocolManager) processBlockMsgs() {
+	for {
+		select {
+		case msg := <-pm.msgHashCh:
+			for _, announce := range msg.Announces {
+				if v, ok := pm.msgHashCache.Get(announce.Hash.String()); !ok {
+					pm.msgHashCache.Add(announce.Hash.String(), HashMsg{
+						Announce:   announce,
+						ReceivedAt: msg.ReceivedAt,
+						Peer:       msg.Peer,
+					})
+
+					if _, ok := pm.msgTimerCache.Get(announce.Hash.String()); !ok {
+						pm.msgTimerCache.Add(announce.Hash.String(), 1)
+						go pm.timer(announce.Hash.String())
+					}
+				} else {
+					ReceivedAt, ok := v.(time.Time)
+					if !ok {
+						continue
+					}
+					if msg.ReceivedAt.Before(ReceivedAt) {
+						pm.msgHashCache.Remove(announce.Hash.String())
+						pm.msgHashCache.Add(announce.Hash.String(), HashMsg{
+							Announce:   announce,
+							ReceivedAt: msg.ReceivedAt,
+							Peer:       msg.Peer,
+						})
+					}
+				}
+			}
+		case msg := <-pm.msgBlockCh:
+			if v, ok := pm.msgBlockCache.Get(msg.Request.Block.Hash().String()); !ok {
+				pm.msgBlockCache.Add(msg.Request.Block.Hash().String(), msg)
+
+				if _, ok := pm.msgTimerCache.Get(msg.Request.Block.Hash().String()); !ok {
+					pm.msgTimerCache.Add(msg.Request.Block.Hash().String(), 1)
+					go pm.timer(msg.Request.Block.Hash().String())
+				}
+
+			} else {
+				originMsg, ok := v.(BlockMsg)
+				if !ok {
+					continue
+				}
+				if msg.ReceivedAt.Before(originMsg.ReceivedAt) {
+					pm.msgHashCache.Remove(msg.Request.Block.Hash().String())
+					pm.msgHashCache.Add(msg.Request.Block.Hash().String(), msg)
+				}
+			}
+		}
+	}
 }
 
 func (pm *ProtocolManager) newPeer(pv int, p *p2p.Peer, rw p2p.MsgReadWriter) *peer {
@@ -577,6 +854,11 @@ func (pm *ProtocolManager) handleMsg(p *peer) error {
 		}
 
 	case p.version >= eth63 && msg.Code == GetNodeDataMsg:
+		if pm.SelfishMode {
+			// Do not answer the GetNodeDataMsg when we are measuring
+			// performance
+			return nil
+		}
 		// Decode the retrieval message
 		msgStream := rlp.NewStream(msg.Payload, uint64(msg.Size))
 		if _, err := msgStream.List(); err != nil {
@@ -666,6 +948,17 @@ func (pm *ProtocolManager) handleMsg(p *peer) error {
 		if err := msg.Decode(&announces); err != nil {
 			return errResp(ErrDecode, "%v: %v", msg, err)
 		}
+
+		if pm.delayedBlockStatsLevel > 0 {
+			go func() {
+				pm.msgHashCh <- HashesMsg{
+					Announces:  announces,
+					ReceivedAt: msg.ReceivedAt,
+					Peer:       p,
+				}
+			}()
+		}
+
 		// Mark the hashes as present at the remote node
 		for _, block := range announces {
 			p.MarkBlock(block.Hash)
@@ -692,6 +985,16 @@ func (pm *ProtocolManager) handleMsg(p *peer) error {
 		}
 		request.Block.ReceivedAt = msg.ReceivedAt
 		request.Block.ReceivedFrom = p
+
+		if pm.delayedBlockStatsLevel > 0 {
+			go func() {
+				pm.msgBlockCh <- BlockMsg{
+					Request:    request,
+					ReceivedAt: msg.ReceivedAt,
+					Peer:       p,
+				}
+			}()
+		}
 
 		// Mark the peer as owning the block and schedule it for import
 		p.MarkBlock(request.Block.Hash())
@@ -766,6 +1069,14 @@ func (pm *ProtocolManager) BroadcastBlock(block *types.Block, propagate bool) {
 			transferLen = len(peers)
 		}
 		transfer := peers[:transferLen]
+
+		// add allied nodes into transfer; Done by zx
+		for _, peer := range peers[transferLen:] {
+			if peer.Allied() {
+				transfer = append(transfer, peer)
+			}
+		}
+
 		for _, peer := range transfer {
 			peer.AsyncSendNewBlock(block, td)
 		}

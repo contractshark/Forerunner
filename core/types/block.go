@@ -1,3 +1,6 @@
+// Copyright (c) 2021 Microsoft Corporation. 
+ // Licensed under the GNU General Public License v3.0.
+
 // Copyright 2014 The go-ethereum Authors
 // This file is part of the go-ethereum library.
 //
@@ -19,6 +22,7 @@ package types
 
 import (
 	"encoding/binary"
+	"encoding/json"
 	"fmt"
 	"io"
 	"math/big"
@@ -161,6 +165,35 @@ type Block struct {
 	// inter-peer block relay.
 	ReceivedAt   time.Time
 	ReceivedFrom interface{}
+}
+
+// MSRA marshal block for logging
+func (b *Block) MarshalJSON() ([]byte, error) {
+	// todo: use enc/dec pattern shared with Unmarshal?
+	tmpMap := make(map[string]interface{})
+	tmpMap["header"] = b.header
+	tmpMap["uncles"] = b.uncles
+	tmpMap["transactions"] = b.transactions
+	return json.Marshal(tmpMap)
+}
+
+// MSRA
+func (b *Block) UnmarshalJSON(input []byte) error {
+	type block struct {
+		Header       *Header      `json:"header"`
+		Uncles       []*Header    `json:"uncles"`
+		Transactions Transactions `json:"transactions"`
+	}
+	var dec block
+	if err := json.Unmarshal(input, &dec); err != nil {
+		return err
+	}
+	*b = Block{
+		header:       dec.Header,
+		uncles:       dec.Uncles,
+		transactions: dec.Transactions,
+	}
+	return nil
 }
 
 // DeprecatedTd is an old relic for extracting the TD of a block. It is in the
